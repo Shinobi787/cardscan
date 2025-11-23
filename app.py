@@ -16,6 +16,8 @@ import re
 import pandas as pd
 import os
 from datetime import datetime
+from google.cloud import vision
+import json
 
 # ------------------ Configuration ------------------
 st.set_page_config(page_title="Business Card Scanner", layout="wide")
@@ -220,3 +222,4 @@ else:
 
 st.markdown("---")
 st.caption("App uses OpenCV + Tesseract OCR. For best accuracy, consider training OCR models or using a commercial OCR API.")
+
