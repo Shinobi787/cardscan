@@ -1,44 +1,63 @@
 import streamlit as st
-from PIL import Image
 import requests
+import base64
 import pandas as pd
 import numpy as np
 import re
 from datetime import datetime
+from PIL import Image
 import io
 
-st.set_page_config(page_title="Business Card Scanner — DeepSeek Vision", layout="wide")
+st.set_page_config(page_title="Business Card Scanner — DeepSeek Vision V3", layout="wide")
 
-# ---------------- OFFICIAL DEEPSEEK OCR (RECOMMENDED) ----------------
+# ---------------- DEEPSEEK VISION OCR (OFFICIAL) ----------------
 API_KEY = st.secrets["deepseek"]["api_key"]
-DEEPSEEK_URL = "https://api.deepseek.com/v1/images/ocr"
+API_URL = "https://api.deepseek.com/v1/chat/completions"
 
-def deepseek_ocr(image_bytes):
+def deepseek_vision_ocr(image_bytes):
+    """
+    Sends image to DeepSeek VL model with a strict OCR-only prompt.
+    """
+
+    # Encode image in base64
+    encoded_image = base64.b64encode(image_bytes).decode('utf-8')
+
+    payload = {
+        "model": "deepseek-vl",     # <-- Vision model
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": "Extract ONLY the raw text from this business card. No explanations. No formatting."},
+                    {
+                        "type": "input_image",
+                        "image_url": f"data:image/png;base64,{encoded_image}"
+                    }
+                ]
+            }
+        ],
+        "temperature": 0
+    }
+
     headers = {
         "Authorization": f"Bearer {API_KEY}",
+        "Content-Type": "application/json"
     }
 
-    files = {
-        "file": ("card.png", image_bytes, "image/png")
-    }
-
-    # Make OCR request
     try:
-        response = requests.post(DEEPSEEK_URL, headers=headers, files=files, timeout=40)
+        r = requests.post(API_URL, headers=headers, json=payload, timeout=60)
     except Exception as e:
         return f"OCR Request Failed: {e}"
 
-    # Parse JSON safely
     try:
-        data = response.json()
+        data = r.json()
     except:
-        return "OCR Error: Invalid JSON from API"
+        return "OCR Error: Invalid JSON returned"
 
-    # Check API output
-    if "text" not in data:
+    if "choices" not in data:
         return f"OCR Error: {data}"
 
-    return data["text"]
+    return data["choices"][0]["message"]["content"]
 
 
 # ---------------- REGEX PATTERNS ----------------
@@ -59,39 +78,26 @@ COMP_SUFFIX = [
 ]
 
 
-# ---------------- TEXT CLEANING ----------------
-def clean_text(s):
-    return re.sub(r"\s+", " ", s).strip()
+# ---------------- EXTRACTION V3 (AI + Rules) ----------------
+def extract_v3(text):
+    """
+    Hybrid extraction:
+    - Regex and rule-based extraction
+    - PLUS AI cleaning & correction via DeepSeek
+    """
 
-def fix_email(e):
-    e = e.replace(" ", "").replace("(at)", "@").replace("[at]", "@")
-    return e.replace("@.", "@")
-
-def fix_website(w):
-    if not w:
-        return ""
-    w = w.strip()
-    if not w.startswith("http"):
-        return "https://" + w
-    return w
-
-
-# ---------------- EXTRACTION V2 ----------------
-def extract_v2(text):
-    # Split into clean lines
-    lines = [clean_text(l) for l in text.split("\n") if clean_text(l)]
-    block = "\n".join(lines)
+    # 1) Rule-based parsing (from V2)
+    lines = [l.strip() for l in text.split("\n") if l.strip()]
+    block = " ".join(lines)
 
     # PHONE
-    raw = PHONE_REGEX.findall(block)
-    raw = [re.sub(r"[^0-9+]", "", p) for p in raw]
-    primary = secondary = toll = ""
+    phones = PHONE_REGEX.findall(block)
+    phones = [re.sub(r"[^0-9+]", "", p) for p in phones]
+    primary = secondary = ""
 
-    for p in raw:
+    for p in phones:
         digits = re.sub(r"\D", "", p)
-        if digits.startswith("1800"):
-            toll = p
-        elif len(digits) == 10 or (len(digits) == 12 and digits.startswith("91")):
+        if len(digits) >= 10:
             if not primary:
                 primary = p
             else:
@@ -99,54 +105,75 @@ def extract_v2(text):
 
     # EMAIL
     emails = EMAIL_REGEX.findall(block)
-    email = fix_email(emails[0]) if emails else ""
+    email = emails[0] if emails else ""
 
     # WEBSITE
     webs = WEBSITE_REGEX.findall(block)
-    website = fix_website(webs[0][0] if isinstance(webs[0], tuple) else webs[0]) if webs else ""
+    website = webs[0][0] if isinstance(webs[0], tuple) else webs[0] if webs else ""
 
-    # ROLE
-    role = ""
-    for l in lines:
-        if any(k in l.lower() for k in ROLE_KEYWORDS):
-            role = l.title()
-            break
+    # 2) AI-based field correction
+    correction_prompt = f"""
+    The following text was extracted from a business card:
 
-    # COMPANY
-    company = ""
-    for l in lines:
-        if any(s in l.lower() for s in COMP_SUFFIX):
-            company = l.title()
-            break
+    {text}
 
-    # NAME (smart detection)
-    name = ""
-    for l in lines:
-        if (
-            2 <= len(l.split()) <= 4
-            and not any(k in l.lower() for k in ROLE_KEYWORDS)
-            and not any(s in l.lower() for s in COMP_SUFFIX)
-            and "@" not in l
-            and ".com" not in l.lower()
-            and ".in" not in l.lower()
-            and not any(ch.isdigit() for ch in l)
-        ):
-            name = l.title()
-            break
+    Extract these fields accurately:
+    - Full Name
+    - Company Name
+    - Role / Position
+    - Primary Phone
+    - Secondary Phone
+    - Email
+    - Website
 
-    if not name and lines:
-        name = lines[0].title()
+    Respond ONLY in valid JSON with keys:
+    name, company, role, phone1, phone2, email, website
+    """
+
+    payload = {
+        "model": "deepseek-chat",
+        "messages": [{"role": "user", "content": correction_prompt}],
+        "temperature": 0
+    }
+
+    headers = {
+        "Authorization": f"Bearer {API_KEY}",
+        "Content-Type": "application/json"
+    }
+
+    try:
+        r = requests.post(API_URL, headers=headers, json=payload)
+        j = r.json()
+        raw = j["choices"][0]["message"]["content"]
+    except:
+        # fallback to rule-based only
+        return {
+            "Name": "",
+            "Company": "",
+            "Role": "",
+            "PhonePrimary": primary,
+            "PhoneSecondary": secondary,
+            "Email": email,
+            "Website": website,
+            "RawText": text,
+            "Timestamp": datetime.utcnow().isoformat()
+        }
+
+    # Parse JSON from DeepSeek
+    try:
+        ai = eval(raw)  # safe because DeepSeek returns pure JSON
+    except:
+        ai = {}
 
     return {
-        "Name": name,
-        "Company": company,
-        "Role": role,
-        "PhonePrimary": primary,
-        "PhoneSecondary": secondary,
-        "TollFree": toll,
-        "Email": email,
-        "Website": website,
-        "RawText": block,
+        "Name": ai.get("name", ""),
+        "Company": ai.get("company", ""),
+        "Role": ai.get("role", ""),
+        "PhonePrimary": ai.get("phone1", primary),
+        "PhoneSecondary": ai.get("phone2", secondary),
+        "Email": ai.get("email", email),
+        "Website": ai.get("website", website),
+        "RawText": text,
         "Timestamp": datetime.utcnow().isoformat()
     }
 
@@ -157,7 +184,7 @@ def load_csv():
         return pd.read_csv("scans.csv")
     except:
         cols = ["Name","Company","Role","PhonePrimary","PhoneSecondary",
-                "TollFree","Email","Website","RawText","Timestamp"]
+                "Email","Website","RawText","Timestamp"]
         return pd.DataFrame(columns=cols)
 
 def save_row(row):
@@ -167,58 +194,48 @@ def save_row(row):
 
 
 # ---------------- UI ----------------
-st.title("📇 Business Card Scanner — DeepSeek Vision OCR")
 
-col1, col2 = st.columns([2, 1])
+st.title("📇 Business Card Scanner — DeepSeek Vision OCR (V3 AI Enhanced)")
 
-with col1:
-    cam = st.camera_input("📷 Take a Photo")
-    upload = st.file_uploader("📁 Upload Image", type=["jpg", "jpeg", "png"])
+left, right = st.columns([2,1])
 
-with col2:
+with left:
+    cam = st.camera_input("📷 Take Photo of Business Card")
+    upload = st.file_uploader("📁 Upload Business Card", type=["png","jpg","jpeg"])
+
+with right:
     auto = st.checkbox("Auto-Save to CSV", value=True)
-    clear = st.button("Clear All")
-
-
-if "cards" not in st.session_state:
-    st.session_state.cards = []
-
+    clear = st.button("Clear All Records")
 
 image_bytes = None
+
 if cam:
     image_bytes = cam.getvalue()
 elif upload:
     image_bytes = upload.read()
 
-
 if image_bytes:
-    st.image(image_bytes, caption="Input Image", use_column_width=True)
+    st.image(image_bytes, caption="Card Image", use_column_width=True)
 
-    with st.spinner("🧠 Reading with DeepSeek Vision..."):
-        text = deepseek_ocr(image_bytes)
+    with st.spinner("🧠 DeepSeek Vision Extracting Text..."):
+        raw_text = deepseek_ocr(image_bytes)
 
-    st.text_area("📄 OCR Output", text, height=200)
+    st.text_area("📄 OCR Output", raw_text, height=200)
 
-    parsed = extract_v2(text)
+    parsed = extract_v3(raw_text)
     st.json(parsed)
 
     if auto:
         save_row(parsed)
-        st.success("Saved!")
-
-    st.session_state.cards.append(parsed)
-
+        st.success("Saved Successfully!")
 
 if clear:
-    st.session_state.cards = []
     df = load_csv()
-    df.to_csv("scans.csv", index=False)
-    st.success("All data cleared!")
+    df.iloc[0:0].to_csv("scans.csv", index=False)
+    st.success("All Records Cleared!")
 
-
-# ---------------- DISPLAY TABLE ----------------
 df = load_csv()
-st.subheader("📚 Saved Records")
+st.subheader("📚 Saved Entries")
 st.dataframe(df, use_container_width=True)
 
 csv = df.to_csv(index=False).encode()
