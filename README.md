@@ -1,32 +1,20 @@
-# Business Card Scanner — Ensemble OCR (EasyOCR + PaddleOCR) with Card Detection
+# Pro Business Card Scanner — EasyOCR + PaddleOCR ensemble
 
-This project is a production-ready business card scanning system with:
+A professional business card scanner that uses ensemble OCR (EasyOCR + PaddleOCR) for accurate text extraction with auto-cropping and advanced field parsing.
 
-- **Automatic card detection** (OpenCV contour detection + perspective transform)
-- **Dual OCR engine (Ensemble)**  
-  - EasyOCR (fast)  
-  - PaddleOCR (accurate)  
-- **Advanced preprocessing** (sharpening, contrast, denoising, resizing)
-- **High-accuracy field extraction**  
-  - Name  
-  - Company  
-  - Role  
-  - Phone  
-  - Toll-Free  
-  - Email  
-  - Website  
-- **Auto-scan mode** (via Streamlit `camera_input`)
-- **CSV Export**
-- **Deduplication to avoid duplicate scans**
-- **Test sample button** to run OCR on a known image
+## Features
 
-This is the most accurate FREE OCR pipeline you can run on Streamlit Cloud (no API keys, no billing).
+- **Auto-detection & Cropping**: Automatically detects and crops business cards from photos
+- **Ensemble OCR**: Combines EasyOCR + PaddleOCR for maximum accuracy
+- **Advanced Field Extraction**: Name, Company, Role, Phone, TollFree, Email, Website
+- **Auto-deduplication**: Prevents duplicate entries
+- **CSV Export**: Saves all scans to `scans.csv`
+- **Sample Testing**: Built-in sample card for testing
 
----
+## Installation & Run (Locally)
 
-## 🚀 Deployment on Streamlit Cloud
-
-### **1. Add Runtime File**
-You MUST force Python 3.10.  
-Create this file in your repo:
-
+1. **Create virtual environment**:
+   ```bash
+   python -m venv venv
+   source venv/bin/activate    # macOS/Linux
+   venv\Scripts\activate       # Windows
