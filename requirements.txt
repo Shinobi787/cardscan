@@ -1,5 +1,9 @@
 streamlit
 pillow
-easyocr
 numpy
 pandas
+opencv-python-headless==4.8.1.78
+easyocr==1.7.1
+paddlepaddle==2.5.2
+paddleocr==2.7.0.3
+onnxruntime==1.16.3
