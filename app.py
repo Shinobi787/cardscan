@@ -6,114 +6,218 @@ import pandas as pd
 import cv2
 import re
 from datetime import datetime
+import os
 
 st.set_page_config(page_title="Business Card Scanner", layout="wide")
 
-# Load EasyOCR (cached)
+# ---------------- OCR LOADER ----------------
 @st.cache_resource
 def load_ocr():
     return easyocr.Reader(['en'], gpu=False)
 
 ocr = load_ocr()
 
-# Regex
+# ---------------- REGEX ----------------
 PHONE_REGEX = re.compile(r"(\+?\d[\d\-\s\(\)]{6,}\d)")
 EMAIL_REGEX = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
 WEBSITE_REGEX = re.compile(r"(https?://\S+|www\.\S+|\b[A-Za-z0-9-]+\.(com|in|net|io|co|org|biz)\b)")
 
-# Preprocess
+ROLE_KEYWORDS = [
+    "ceo","cto","coo","cfo","founder","director","owner","manager",
+    "lead","engineer","marketing","sales","product","executive","md","gm"
+]
+
+COMP_SUFFIX = [
+    "pvt","private","limited","ltd","llp","inc","co","company","tech",
+    "technologies","solutions","studio","labs","group","enterprise"
+]
+
+# ---------------- ENHANCE IMAGE ----------------
 def enhance(img):
     img = img.convert("RGB")
+
+    if max(img.size) < 1100:
+        scale = int(1100 / max(img.size))
+        img = img.resize((img.width * scale, img.height * scale), Image.LANCZOS)
+
     img = ImageOps.autocontrast(img)
-    img = ImageEnhance.Sharpness(img).enhance(1.2)
-    img = ImageEnhance.Contrast(img).enhance(1.1)
+    img = ImageEnhance.Sharpness(img).enhance(1.25)
+    img = ImageEnhance.Contrast(img).enhance(1.15)
+    img = img.filter(ImageFilter.MedianFilter(3))
     return img
 
-# OCR
+# ---------------- OCR ----------------
 def read_text(pil_img):
-    img = np.array(pil_img)
+    arr = np.array(pil_img)
     try:
-        result = ocr.readtext(img, detail=0, paragraph=True)
-        return "\n".join(result)
+        lines = ocr.readtext(arr, detail=0, paragraph=True)
+        return "\n".join([l.strip() for l in lines if l.strip()])
     except:
         return ""
 
-# Extraction
-def extract(text):
-    lines = [l.strip() for l in text.splitlines() if l.strip()]
+# ---------------- EXTRACTION ENGINE V2 ----------------
+def clean_text(s):
+    return re.sub(r'\s+', ' ', s).strip()
+
+def fix_email(e):
+    e = e.replace(" ", "").replace("(at)", "@").replace("[at]", "@")
+    e = e.replace("@.", "@")
+    if ".in" in e or ".com" in e:
+        return e
+    e = re.sub(r'(@[A-Za-z0-9]+)(in|com)$', r'\1.\2', e)
+    return e
+
+def fix_website(w):
+    w = w.strip().replace(" ", "")
+    if not w:
+        return ""
+    if not w.startswith("http"):
+        w = "https://" + w
+    return w
+
+def extract_v2(text):
+    lines = [clean_text(l) for l in text.split("\n") if clean_text(l)]
     block = "\n".join(lines)
 
-    phones = PHONE_REGEX.findall(block)
-    phone = phones[0] if phones else ""
+    # ----- PHONE -----
+    all_phones = PHONE_REGEX.findall(block)
+    all_phones = [re.sub(r'[^0-9+]', '', p) for p in all_phones]
 
+    primary = secondary = toll = ""
+
+    for p in all_phones:
+        digits = re.sub(r"\D", "", p)
+
+        if digits.startswith("1800"):
+            toll = p
+            continue
+
+        if len(digits) == 10 or (len(digits) == 12 and digits.startswith("91")):
+            if not primary:
+                primary = p
+            else:
+                secondary = p
+
+    # ----- EMAIL -----
     emails = EMAIL_REGEX.findall(block)
-    email = emails[0] if emails else ""
+    email = fix_email(emails[0]) if emails else ""
 
+    # ----- WEBSITE -----
     webs = WEBSITE_REGEX.findall(block)
-    website = webs[0] if webs else ""
+    website = fix_website(webs[0][0] if isinstance(webs[0], tuple) else webs[0]) if webs else ""
 
-    name = ""
-    if lines:
-        name = lines[0].title()
+    # ----- ROLE -----
+    role = ""
+    for l in lines:
+        if any(k in l.lower() for k in ROLE_KEYWORDS):
+            role = l.title()
+            break
 
+    # ----- COMPANY -----
     company = ""
-    if len(lines) > 1:
-        company = lines[1].title()
+    for l in lines:
+        if any(s in l.lower() for s in COMP_SUFFIX):
+            company = l.title()
+            break
+
+    # ----- NAME -----
+    name = ""
+    for l in lines:
+        if (
+            2 <= len(l.split()) <= 4 and
+            not any(k in l.lower() for k in ROLE_KEYWORDS) and
+            not any(s in l.lower() for s in COMP_SUFFIX) and
+            not "@" in l and
+            not ".com" in l.lower() and
+            not ".in" in l.lower() and
+            not any(ch.isdigit() for ch in l)
+        ):
+            name = l.title()
+            break
+
+    if not name and lines:
+        name = lines[0].title()
 
     return {
         "Name": name,
         "Company": company,
-        "Phone": phone,
+        "Role": role,
+        "PhonePrimary": primary,
+        "PhoneSecondary": secondary,
+        "TollFree": toll,
         "Email": email,
         "Website": website,
-        "Raw": text,
+        "RawText": block,
         "Timestamp": datetime.utcnow().isoformat()
     }
 
-# Storage
+# ---------------- CSV STORAGE ----------------
 def load_csv():
     try:
         return pd.read_csv("scans.csv")
     except:
-        return pd.DataFrame(columns=["Name","Company","Phone","Email","Website","Raw","Timestamp"])
+        return pd.DataFrame(columns=[
+            "Name","Company","Role","PhonePrimary",
+            "PhoneSecondary","TollFree","Email",
+            "Website","RawText","Timestamp"
+        ])
 
-def save_row(d):
+def save_row(entry):
     df = load_csv()
-    df.loc[len(df)] = d
+    df.loc[len(df)] = entry
     df.to_csv("scans.csv", index=False)
 
-# UI
-st.title("📇 Business Card Scanner (EasyOCR Stable Version)")
+# ---------------- UI ----------------
+st.title("📇 Business Card Scanner — EasyOCR + Extraction V2")
 
-col1, col2 = st.columns(2)
+col1, col2 = st.columns([2, 1])
 
 with col1:
     cam = st.camera_input("Take a Photo")
-    upload = st.file_uploader("Upload image", type=["png","jpg","jpeg"])
+    upload = st.file_uploader("Upload Image", type=["png", "jpg", "jpeg"])
 
-image = None
+with col2:
+    auto = st.checkbox("Auto-Save", value=True)
+    show_raw = st.checkbox("Show OCR Text", value=False)
+    clear = st.button("Clear Session")
+
+if "cards" not in st.session_state:
+    st.session_state.cards = []
+
+img = None
 if cam:
-    image = Image.open(cam)
+    img = Image.open(cam)
 elif upload:
-    image = Image.open(upload)
+    img = Image.open(upload)
 
-if image:
-    st.image(image, caption="Original", use_column_width=True)
+if img:
+    st.image(img, caption="Original", use_column_width=True)
 
-    pre = enhance(image)
-    st.image(pre, caption="Processed", use_column_width=True)
+    enhanced = enhance(img)
+    st.image(enhanced, caption="Processed", use_column_width=True)
 
-    text = read_text(pre)
-    st.text_area("OCR Output", text, height=200)
+    with st.spinner("Extracting text..."):
+        text = read_text(enhanced)
 
-    data = extract(text)
-    st.write("### Extracted Fields")
-    st.json(data)
+    if show_raw:
+        st.text_area("OCR Output", text, height=200)
 
-    if st.button("Save"):
-        save_row(data)
-        st.success("Saved!")
+    parsed = extract_v2(text)
+    st.json(parsed)
+
+    if auto:
+        save_row(parsed)
+        st.success("Saved automatically!")
+
+    st.session_state.cards.append(parsed)
+
+if clear:
+    st.session_state.cards = []
+    st.success("Session cleared")
 
 df = load_csv()
-st.write("### Saved Scans")
+st.subheader("📄 Saved Entries")
 st.dataframe(df, use_container_width=True)
+
+csv = df.to_csv(index=False).encode("utf-8")
+st.download_button("Download CSV", csv, "cards.csv", "text/csv")
