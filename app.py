@@ -7,70 +7,95 @@ import json
 import io
 from datetime import datetime
 
-st.set_page_config(page_title="Business Card Scanner", layout="wide")
+st.set_page_config(page_title="Business Card Scanner — DeepSeek Vision", layout="wide")
 
-# ---------------- FREE OCR API ----------------
-def free_ocr(image_bytes):
-    """Use free OCR.space API"""
+# ---------------- DEEPSEEK API CONFIG ----------------
+if "deepseek" not in st.secrets or "api_key" not in st.secrets["deepseek"]:
+    st.error("🔑 DeepSeek API Key not found in secrets!")
+    st.info("""
+    **To set up your API key:**
+    1. Get a DeepSeek API key from https://platform.deepseek.com/
+    2. In Streamlit Cloud, go to Settings → Secrets
+    3. Add this:
+    ```
+    [deepseek]
+    api_key = "your_actual_api_key_here"
+    ```
+    """)
+    st.stop()
+
+API_KEY = st.secrets["deepseek"]["api_key"]
+API_URL = "https://api.deepseek.com/v1/chat/completions"
+
+# ---------------- CORRECT DEEPSEEK VISION API CALL ----------------
+def deepseek_ocr(image_bytes):
+    """Use DeepSeek Vision API with CORRECT format"""
     try:
         # Convert image to base64
         encoded_image = base64.b64encode(image_bytes).decode('utf-8')
         
-        # Use OCR.space free API (no key needed for limited use)
-        url = "https://api.ocr.space/parse/image"
+        # CORRECT API payload for DeepSeek Vision
         payload = {
-            'base64Image': f'data:image/jpeg;base64,{encoded_image}',
-            'language': 'eng',
-            'isOverlayRequired': False,
-            'OCREngine': 2
+            "model": "deepseek-vl",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": "Extract all text from this business card image exactly as it appears. Preserve line breaks and formatting. Return ONLY the raw text, no explanations."
+                        },
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:image/jpeg;base64,{encoded_image}"
+                            }
+                        }
+                    ]
+                }
+            ],
+            "max_tokens": 2048,
+            "temperature": 0.1,
+            "stream": False
         }
+
+        headers = {
+            "Authorization": f"Bearer {API_KEY}",
+            "Content-Type": "application/json"
+        }
+
+        response = requests.post(API_URL, headers=headers, json=payload, timeout=60)
         
-        response = requests.post(url, data=payload, timeout=30)
+        if response.status_code != 200:
+            error_detail = response.text
+            try:
+                error_json = response.json()
+                error_detail = error_json.get('error', {}).get('message', error_detail)
+            except:
+                pass
+            return f"API Error {response.status_code}: {error_detail}"
+        
         data = response.json()
         
-        if response.status_code == 200 and data['IsErroredOnProcessing'] == False:
-            return data['ParsedResults'][0]['ParsedText']
+        # Extract the response content
+        if "choices" in data and len(data["choices"]) > 0:
+            return data["choices"][0]["message"]["content"]
         else:
-            return f"OCR Error: {data.get('ErrorMessage', 'Unknown error')}"
-            
+            return f"Unexpected API response format: {json.dumps(data, indent=2)}"
+        
+    except requests.exceptions.Timeout:
+        return "OCR Error: Request timeout - try again"
     except Exception as e:
         return f"OCR Error: {str(e)}"
 
-# Alternative: Use another free OCR service
-def alternative_ocr(image_bytes):
-    """Alternative free OCR service"""
-    try:
-        # Convert to base64
-        encoded_image = base64.b64encode(image_bytes).decode('utf-8')
-        
-        # Using a simple OCR API
-        api_url = "https://api.ocr.space/parse/image"
-        payload = {
-            'apikey': 'helloworld',  # Free key
-            'base64Image': f'data:image/jpeg;base64,{encoded_image}',
-            'language': 'eng',
-            'OCREngine': 1
-        }
-        
-        response = requests.post(api_url, data=payload, timeout=30)
-        data = response.json()
-        
-        if data.get('ParsedResults'):
-            return data['ParsedResults'][0]['ParsedText']
-        else:
-            return "OCR Error: No text found"
-            
-    except Exception as e:
-        return f"OCR Error: {str(e)}"
-
-# ---------------- FIELD EXTRACTION ----------------
+# ---------------- IMPROVED FIELD EXTRACTION ----------------
 PHONE_REGEX = re.compile(r"(\+?\d[\d\-\s\(\)]{7,}\d)")
 EMAIL_REGEX = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
 WEBSITE_REGEX = re.compile(r"(https?://[^\s]+|www\.[^\s]+|[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})")
 
-def extract_fields_simple(text):
-    """Simple regex-based field extraction"""
-    if text.startswith("OCR Error"):
+def extract_fields_advanced(text):
+    """Advanced field extraction with better heuristics"""
+    if any(error in text for error in ["OCR Error", "API Error"]):
         return {
             "Name": "", "Company": "", "Role": "",
             "Phone": "", "Email": "", "Website": "",
@@ -80,9 +105,8 @@ def extract_fields_simple(text):
 
     lines = [line.strip() for line in text.split("\n") if line.strip()]
     
-    # Initialize data
     data = {
-        "Name": lines[0] if lines else "",
+        "Name": "",
         "Company": "",
         "Role": "",
         "Phone": "",
@@ -92,12 +116,10 @@ def extract_fields_simple(text):
         "Timestamp": datetime.now().isoformat()
     }
     
-    # Extract contact info using regex
+    # Extract contact info
     phones = PHONE_REGEX.findall(text)
     if phones:
-        # Clean phone number
-        phone_clean = re.sub(r'[^\d+]', '', phones[0])
-        data["Phone"] = phone_clean
+        data["Phone"] = re.sub(r'[^\d+]', '', phones[0])
     
     emails = EMAIL_REGEX.findall(text)
     if emails:
@@ -105,32 +127,47 @@ def extract_fields_simple(text):
     
     websites = WEBSITE_REGEX.findall(text)
     if websites:
-        # Take the first website that looks legitimate
-        for web in websites:
-            if len(web) > 5 and '.' in web:
-                data["Website"] = web
+        for web in websites[:3]:  # Check first 3 matches
+            clean_web = web if isinstance(web, str) else web[0]
+            if len(clean_web) > 5 and '.' in clean_web and '@' not in clean_web:
+                data["Website"] = clean_web
                 break
     
-    # Simple heuristics for company and role
-    if len(lines) > 1:
-        for i in range(1, min(5, len(lines))):
-            line = lines[i]
+    # Advanced name/company/role extraction
+    if lines:
+        # Name is usually first non-empty line
+        data["Name"] = lines[0]
+        
+        # Analyze remaining lines
+        remaining_lines = lines[1:]
+        
+        for i, line in enumerate(remaining_lines):
             line_lower = line.lower()
             
-            # Role indicators
-            role_indicators = ['manager', 'director', 'president', 'ceo', 'cto', 'cfo', 
-                              'engineer', 'analyst', 'specialist', 'consultant', 'officer',
-                              'head', 'lead', 'developer', 'designer']
+            # Role detection
+            role_patterns = [
+                r'\b(manager|director|president|ceo|cto|cfo|vp|vice president|engineer|analyst|specialist|consultant|officer|head|lead|developer|designer|architect)\b',
+                r'\b(senior|junior|principal|staff)\s+\w+',
+                r'\b(head|chief|lead)\s+of\s+\w+'
+            ]
             
-            # Company indicators  
-            company_indicators = ['inc', 'corp', 'llc', 'ltd', 'company', 'co.', 'group', 'technologies']
+            for pattern in role_patterns:
+                if re.search(pattern, line_lower, re.IGNORECASE):
+                    data["Role"] = line
+                    break
             
-            if any(role in line_lower for role in role_indicators) and not data["Role"]:
-                data["Role"] = line
-            elif any(company in line_lower for company in company_indicators) and not data["Company"]:
+            # Company detection
+            company_indicators = ['inc', 'corp', 'llc', 'ltd', 'company', 'co.', 'group', 'technologies', 'solutions', 'systems', 'enterprises']
+            if any(indicator in line_lower for indicator in company_indicators):
                 data["Company"] = line
-            elif not data["Company"] and len(line.split()) <= 4 and line.upper() == line:
-                data["Company"] = line
+            elif not data["Company"] and (line.isupper() or any(word.istitle() for word in line.split())):
+                # Company names often have proper capitalization or are all caps
+                if len(line.split()) <= 4:  # Reasonable company name length
+                    data["Company"] = line
+            
+            # Stop after checking a few lines
+            if i >= 4:
+                break
     
     return data
 
@@ -157,8 +194,8 @@ def save_scan(data):
         return False
 
 # ---------------- STREAMLIT UI ----------------
-st.title("📇 Business Card Scanner")
-st.markdown("**Free OCR - No API Key Required**")
+st.title("📇 Business Card Scanner — DeepSeek Vision")
+st.markdown("**Powered by DeepSeek Vision AI**")
 
 col1, col2 = st.columns([2, 1])
 
@@ -193,26 +230,21 @@ with col2:
             st.error(f"Clear error: {e}")
 
 # Process image when available
-if image_bytes and st.button("🔍 Scan Business Card", type="primary"):
-    with st.spinner("Scanning with OCR..."):
-        # Try primary OCR first, fallback to alternative
-        raw_text = free_ocr(image_bytes)
-        
-        # If first OCR fails, try alternative
-        if raw_text.startswith("OCR Error"):
-            raw_text = alternative_ocr(image_bytes)
+if image_bytes and st.button("🔍 Scan with DeepSeek Vision", type="primary"):
+    with st.spinner("🔄 Calling DeepSeek Vision API..."):
+        raw_text = deepseek_ocr(image_bytes)
         
         st.subheader("📄 OCR Results")
         
-        if raw_text and not raw_text.startswith("OCR Error"):
-            st.success("✅ OCR Successful!")
+        if raw_text and not any(error in raw_text for error in ["OCR Error", "API Error"]):
+            st.success("✅ DeepSeek Vision OCR Successful!")
             
             # Show raw text
             with st.expander("📋 Raw Extracted Text"):
                 st.text_area("Full text", raw_text, height=200, key="raw_text")
             
             # Extract fields
-            parsed_data = extract_fields_simple(raw_text)
+            parsed_data = extract_fields_advanced(raw_text)
             
             # Display extracted fields
             st.subheader("👤 Extracted Information")
@@ -220,20 +252,14 @@ if image_bytes and st.button("🔍 Scan Business Card", type="primary"):
             col1, col2 = st.columns(2)
             
             with col1:
-                if parsed_data["Name"]:
-                    st.text_input("Name", parsed_data["Name"], key="name_display")
-                if parsed_data["Company"]:
-                    st.text_input("Company", parsed_data["Company"], key="company_display")
-                if parsed_data["Role"]:
-                    st.text_input("Role", parsed_data["Role"], key="role_display")
+                st.text_input("Name", parsed_data["Name"], key="name_display")
+                st.text_input("Company", parsed_data["Company"], key="company_display")
+                st.text_input("Role", parsed_data["Role"], key="role_display")
             
             with col2:
-                if parsed_data["Phone"]:
-                    st.text_input("Phone", parsed_data["Phone"], key="phone_display")
-                if parsed_data["Email"]:
-                    st.text_input("Email", parsed_data["Email"], key="email_display")
-                if parsed_data["Website"]:
-                    st.text_input("Website", parsed_data["Website"], key="website_display")
+                st.text_input("Phone", parsed_data["Phone"], key="phone_display")
+                st.text_input("Email", parsed_data["Email"], key="email_display")
+                st.text_input("Website", parsed_data["Website"], key="website_display")
             
             # Save data
             if auto_save:
@@ -245,12 +271,28 @@ if image_bytes and st.button("🔍 Scan Business Card", type="primary"):
                         st.success("✅ Scan saved!")
         else:
             st.error(f"❌ {raw_text}")
-            st.info("""
-            **Troubleshooting tips:**
-            - Make sure the image is clear and well-lit
-            - Try a different image format (JPG works best)
-            - Ensure the text is readable and not blurry
-            """)
+            
+            # Debug information
+            with st.expander("🔧 Debug Information"):
+                st.write("**API Key Status:**", "Configured" if API_KEY else "Missing")
+                st.write("**Image Size:**", f"{len(image_bytes)} bytes")
+                
+                if st.button("Test DeepSeek API Connection"):
+                    try:
+                        headers = {"Authorization": f"Bearer {API_KEY}"}
+                        # Test with a simple text request
+                        test_payload = {
+                            "model": "deepseek-chat",
+                            "messages": [{"role": "user", "content": "Say 'API is working'"}],
+                            "max_tokens": 10
+                        }
+                        response = requests.post(API_URL, headers=headers, json=test_payload, timeout=30)
+                        if response.status_code == 200:
+                            st.success("✅ DeepSeek API Connection Successful!")
+                        else:
+                            st.error(f"❌ API Test Failed: {response.status_code} - {response.text}")
+                    except Exception as e:
+                        st.error(f"❌ API Test Error: {e}")
 
 # Display history
 st.subheader("📚 Scan History")
@@ -274,35 +316,16 @@ if not df.empty:
 else:
     st.info("No scans yet. Capture a business card to get started!")
 
-# Manual entry fallback
-with st.expander("✍️ Manual Entry (Fallback)"):
-    st.write("If OCR doesn't work well, you can manually enter the details:")
+# API status
+with st.expander("ℹ️ DeepSeek Vision Status"):
+    st.markdown("""
+    **DeepSeek Vision Features:**
+    - High accuracy OCR for business cards
+    - Handles various fonts and layouts
+    - Extracts text from complex backgrounds
+    - Supports multiple languages
     
-    with st.form("manual_entry"):
-        manual_name = st.text_input("Name")
-        manual_company = st.text_input("Company")
-        manual_role = st.text_input("Role")
-        manual_phone = st.text_input("Phone")
-        manual_email = st.text_input("Email")
-        manual_website = st.text_input("Website")
-        
-        if st.form_submit_button("Add Manual Entry"):
-            if manual_name:
-                manual_data = {
-                    "Name": manual_name,
-                    "Company": manual_company,
-                    "Role": manual_role,
-                    "Phone": manual_phone,
-                    "Email": manual_email,
-                    "Website": manual_website,
-                    "RawText": "Manually entered",
-                    "Timestamp": datetime.now().isoformat()
-                }
-                if save_scan(manual_data):
-                    st.success("✅ Manual entry saved!")
-                    st.rerun()
-            else:
-                st.error("Please at least enter a name")
-
-st.markdown("---")
-st.caption("This app uses free OCR services - no API key required!")
+    **Current Status:** ✅ Configured
+    **Model:** deepseek-vl
+    **Endpoint:** https://api.deepseek.com/v1/chat/completions
+    """)
