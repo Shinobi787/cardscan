@@ -1,37 +1,26 @@
-# Pro Business Card Scanner — EasyOCR + PaddleOCR ensemble
+# Business Card Scanner — EasyOCR, No OpenCV (Cloud-friendly)
 
-Features:
-- Auto-detects and crops business card from photo.
-- Ensemble OCR: EasyOCR + PaddleOCR (Paddle is optional; app falls back to EasyOCR).
-- Advanced extraction logic: Name, Company, Role, Phone, TollFree, Email, Website.
-- Auto-dedup and saves scans to scans.csv.
-- Test with your uploaded sample image (button provided).
+This app scans business cards using EasyOCR and improved image preprocessing (no OpenCV). It auto-detects unique scans and saves them to scans.csv.
 
-## Install & Run (locally)
-1. Create environment:
-   python -m venv venv
-   source venv/bin/activate    # macOS/Linux
-   venv\\Scripts\\activate     # Windows
+## How it works
+- Use the browser camera "Take photo" button or upload an image.
+- The app preprocesses the image (contrast, sharpen, denoise, resize).
+- EasyOCR reads text; the app then extracts Name/Company/Role/Phone/TollFree/Email/Website.
+- Unique scans are appended to the session and saved to scans.csv (if auto-save enabled).
+- There's a "Test with sample image" button that uses a sample file at `/mnt/data/07c1090d-a232-4e82-bb1f-16abd2b9ea93.png` (your uploaded image).
 
-2. Install:
-   pip install -r requirements.txt
+## Setup
+1. Create a repo and add `app.py` and `requirements.txt`.
+2. Deploy to Streamlit Cloud (or run locally).
+   - Locally:
+     python -m venv venv
+     source venv/bin/activate   # macOS/Linux
+     venv\\Scripts\\activate    # Windows
+     pip install -r requirements.txt
+     streamlit run app.py
 
-   NOTE: paddlepaddle may need a specific wheel for your OS. If installation fails, remove `paddleocr` and `paddlepaddle` from requirements and re-run pip install.
+## Tips for best results
+- Good lighting and a flat, centered card give the best OCR results.
+- If OCR misses fields, try "Show raw OCR text" to see what the OCR read and adjust lighting/position.
+- If you want even better accuracy, we can add an optional PaddleOCR or ONNX-based crop/detector — but those may require additional installations.
 
-3. Run:
-   streamlit run app.py
-
-## Deploy to Streamlit Cloud
-1. Push to GitHub.
-2. Create a Streamlit Cloud app pointing to this repo.
-3. Streamlit will install dependencies (may take longer because of easyocr/paddle).
-4. If paddlepaddle installation fails in Cloud, the app will still run using EasyOCR only.
-
-## Tips for best OCR
-- Good lighting, focused, flat card yields best results.
-- Use "Auto-detect & crop" to isolate the card before OCR (recommended).
-- If detection fails on very cluttered backgrounds, try a clean background or use upload.
-
-## Troubleshooting
-- If PaddleOCR fails to initialize, you'll see a message and app will use EasyOCR only.
-- If install for paddlepaddle times out on Streamlit Cloud, consider running locally or on a VPS (recommended for heavy workloads).
