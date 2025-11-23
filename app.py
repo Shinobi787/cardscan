@@ -1,21 +1,27 @@
 import streamlit as st
-from PIL import Image, ImageOps, ImageEnhance, ImageFilter
-import easyocr
-import numpy as np
+from PIL import Image
+import requests
 import pandas as pd
-import cv2
+import numpy as np
 import re
 from datetime import datetime
-import os
 
 st.set_page_config(page_title="Business Card Scanner", layout="wide")
 
-# ---------------- OCR LOADER ----------------
-@st.cache_resource
-def load_ocr():
-    return easyocr.Reader(['en'], gpu=False)
+API_KEY = "helloworld"   # Free OCR.Space demo key
 
-ocr = load_ocr()
+# ---------------- OCR API ----------------
+def ocr_space(image_bytes):
+    url = "https://api.ocr.space/parse/image"
+    r = requests.post(
+        url,
+        files={"file": ("card.png", image_bytes)},
+        data={"apikey": API_KEY}
+    )
+    res = r.json()
+    if res.get("ParsedResults"):
+        return res["ParsedResults"][0]["ParsedText"]
+    return ""
 
 # ---------------- REGEX ----------------
 PHONE_REGEX = re.compile(r"(\+?\d[\d\-\s\(\)]{6,}\d)")
@@ -32,30 +38,7 @@ COMP_SUFFIX = [
     "technologies","solutions","studio","labs","group","enterprise"
 ]
 
-# ---------------- ENHANCE IMAGE ----------------
-def enhance(img):
-    img = img.convert("RGB")
-
-    if max(img.size) < 1100:
-        scale = int(1100 / max(img.size))
-        img = img.resize((img.width * scale, img.height * scale), Image.LANCZOS)
-
-    img = ImageOps.autocontrast(img)
-    img = ImageEnhance.Sharpness(img).enhance(1.25)
-    img = ImageEnhance.Contrast(img).enhance(1.15)
-    img = img.filter(ImageFilter.MedianFilter(3))
-    return img
-
-# ---------------- OCR ----------------
-def read_text(pil_img):
-    arr = np.array(pil_img)
-    try:
-        lines = ocr.readtext(arr, detail=0, paragraph=True)
-        return "\n".join([l.strip() for l in lines if l.strip()])
-    except:
-        return ""
-
-# ---------------- EXTRACTION ENGINE V2 ----------------
+# ---------------- EXTRACTION V2 ----------------
 def clean_text(s):
     return re.sub(r'\s+', ' ', s).strip()
 
@@ -64,7 +47,6 @@ def fix_email(e):
     e = e.replace("@.", "@")
     if ".in" in e or ".com" in e:
         return e
-    e = re.sub(r'(@[A-Za-z0-9]+)(in|com)$', r'\1.\2', e)
     return e
 
 def fix_website(w):
@@ -82,17 +64,13 @@ def extract_v2(text):
     # ----- PHONE -----
     all_phones = PHONE_REGEX.findall(block)
     all_phones = [re.sub(r'[^0-9+]', '', p) for p in all_phones]
-
     primary = secondary = toll = ""
 
     for p in all_phones:
         digits = re.sub(r"\D", "", p)
-
         if digits.startswith("1800"):
             toll = p
-            continue
-
-        if len(digits) == 10 or (len(digits) == 12 and digits.startswith("91")):
+        elif len(digits) == 10 or (len(digits) == 12 and digits.startswith("91")):
             if not primary:
                 primary = p
             else:
@@ -151,72 +129,68 @@ def extract_v2(text):
         "Timestamp": datetime.utcnow().isoformat()
     }
 
-# ---------------- CSV STORAGE ----------------
+# ---------------- STORAGE ----------------
 def load_csv():
     try:
         return pd.read_csv("scans.csv")
     except:
         return pd.DataFrame(columns=[
-            "Name","Company","Role","PhonePrimary",
-            "PhoneSecondary","TollFree","Email",
-            "Website","RawText","Timestamp"
+            "Name","Company","Role","PhonePrimary","PhoneSecondary",
+            "TollFree","Email","Website","RawText","Timestamp"
         ])
 
-def save_row(entry):
+def save_row(d):
     df = load_csv()
-    df.loc[len(df)] = entry
+    df.loc[len(df)] = d
     df.to_csv("scans.csv", index=False)
 
 # ---------------- UI ----------------
-st.title("📇 Business Card Scanner — EasyOCR + Extraction V2")
+st.title("📇 Business Card Scanner — OCR.Space + Extraction V2")
 
-col1, col2 = st.columns([2, 1])
+col1, col2 = st.columns([2,1])
 
 with col1:
     cam = st.camera_input("Take a Photo")
-    upload = st.file_uploader("Upload Image", type=["png", "jpg", "jpeg"])
+    upload = st.file_uploader("Upload Image", type=["png","jpg","jpeg"])
 
 with col2:
     auto = st.checkbox("Auto-Save", value=True)
-    show_raw = st.checkbox("Show OCR Text", value=False)
-    clear = st.button("Clear Session")
+    clear = st.button("Clear All")
 
 if "cards" not in st.session_state:
     st.session_state.cards = []
 
-img = None
+image_bytes = None
 if cam:
-    img = Image.open(cam)
+    image_bytes = cam.getvalue()
 elif upload:
-    img = Image.open(upload)
+    image_bytes = upload.read()
 
-if img:
-    st.image(img, caption="Original", use_column_width=True)
-
-    enhanced = enhance(img)
-    st.image(enhanced, caption="Processed", use_column_width=True)
+if image_bytes:
+    st.image(image_bytes, caption="Input", use_column_width=True)
 
     with st.spinner("Extracting text..."):
-        text = read_text(enhanced)
+        text = ocr_space(image_bytes)
 
-    if show_raw:
-        st.text_area("OCR Output", text, height=200)
+    st.text_area("OCR Output", text, height=200)
 
     parsed = extract_v2(text)
     st.json(parsed)
 
     if auto:
         save_row(parsed)
-        st.success("Saved automatically!")
+        st.success("Saved!")
 
     st.session_state.cards.append(parsed)
 
 if clear:
     st.session_state.cards = []
-    st.success("Session cleared")
+    df = load_csv()
+    df.to_csv("scans.csv", index=False)
+    st.success("All cleared!")
 
 df = load_csv()
-st.subheader("📄 Saved Entries")
+st.subheader("📄 Saved Data")
 st.dataframe(df, use_container_width=True)
 
 csv = df.to_csv(index=False).encode("utf-8")
