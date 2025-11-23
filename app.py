@@ -7,35 +7,46 @@ import re
 from datetime import datetime
 import io
 
-st.set_page_config(page_title="Business Card Scanner — DeepSeek OCR", layout="wide")
+st.set_page_config(page_title="Business Card Scanner — DeepSeek Vision", layout="wide")
 
-# ---------------- DeepSeek OCR API (NO KEY NEEDED) ----------------
-DEEPSEEK_OCR_URL = "https://deepseek-ocr-proxy.onrender.com/ocr" 
-# (Public proxy maintained for free OCR — no key needed)
+# ---------------- OFFICIAL DEEPSEEK OCR (RECOMMENDED) ----------------
+API_KEY = st.secrets["deepseek"]["api_key"]
+DEEPSEEK_URL = "https://api.deepseek.com/v1/images/ocr"
 
 def deepseek_ocr(image_bytes):
+    headers = {
+        "Authorization": f"Bearer {API_KEY}",
+    }
+
+    files = {
+        "file": ("card.png", image_bytes, "image/png")
+    }
+
+    # Make OCR request
     try:
-        files = {"file": ("card.png", image_bytes, "image/png")}
-        res = requests.post(DEEPSEEK_OCR_URL, files=files, timeout=40)
+        response = requests.post(DEEPSEEK_URL, headers=headers, files=files, timeout=40)
     except Exception as e:
         return f"OCR Request Failed: {e}"
 
     # Parse JSON safely
     try:
-        data = res.json()
+        data = response.json()
     except:
-        return "OCR Error: Invalid JSON from OCR API"
+        return "OCR Error: Invalid JSON from API"
 
+    # Check API output
     if "text" not in data:
-        return "OCR Error: No text returned"
+        return f"OCR Error: {data}"
 
     return data["text"]
 
 
-# ---------------- REGEX ----------------
+# ---------------- REGEX PATTERNS ----------------
 PHONE_REGEX = re.compile(r"(\+?\d[\d\-\s\(\)]{6,}\d)")
 EMAIL_REGEX = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
-WEBSITE_REGEX = re.compile(r"(https?://\S+|www\.\S+|\b[A-Za-z0-9-]+\.(com|in|net|io|co|org|biz)\b)")
+WEBSITE_REGEX = re.compile(
+    r"(https?://\S+|www\.\S+|\b[A-Za-z0-9-]+\.(com|in|net|io|co|org|biz)\b)"
+)
 
 ROLE_KEYWORDS = [
     "ceo","cto","coo","cfo","founder","director","owner","manager",
@@ -47,7 +58,8 @@ COMP_SUFFIX = [
     "technologies","solutions","studio","labs","group","enterprise"
 ]
 
-# ---------------- CLEANING ----------------
+
+# ---------------- TEXT CLEANING ----------------
 def clean_text(s):
     return re.sub(r"\s+", " ", s).strip()
 
@@ -56,16 +68,17 @@ def fix_email(e):
     return e.replace("@.", "@")
 
 def fix_website(w):
-    w = w.strip()
     if not w:
         return ""
+    w = w.strip()
     if not w.startswith("http"):
         return "https://" + w
     return w
 
 
-# ---------------- EXTRACTION ENGINE V2 ----------------
+# ---------------- EXTRACTION V2 ----------------
 def extract_v2(text):
+    # Split into clean lines
     lines = [clean_text(l) for l in text.split("\n") if clean_text(l)]
     block = "\n".join(lines)
 
@@ -106,16 +119,18 @@ def extract_v2(text):
             company = l.title()
             break
 
-    # NAME (smart guess)
+    # NAME (smart detection)
     name = ""
     for l in lines:
-        if (2 <= len(l.split()) <= 4
+        if (
+            2 <= len(l.split()) <= 4
             and not any(k in l.lower() for k in ROLE_KEYWORDS)
             and not any(s in l.lower() for s in COMP_SUFFIX)
             and "@" not in l
             and ".com" not in l.lower()
             and ".in" not in l.lower()
-            and not any(ch.isdigit() for ch in l)):
+            and not any(ch.isdigit() for ch in l)
+        ):
             name = l.title()
             break
 
@@ -136,7 +151,7 @@ def extract_v2(text):
     }
 
 
-# ---------------- STORAGE ----------------
+# ---------------- CSV STORAGE ----------------
 def load_csv():
     try:
         return pd.read_csv("scans.csv")
@@ -152,44 +167,47 @@ def save_row(row):
 
 
 # ---------------- UI ----------------
-st.title("📇 Business Card Scanner — DeepSeek OCR (100% Stable)")
+st.title("📇 Business Card Scanner — DeepSeek Vision OCR")
 
-left, right = st.columns([2,1])
+col1, col2 = st.columns([2, 1])
 
-with left:
-    cam = st.camera_input("Take a Photo")
-    upload = st.file_uploader("Upload Image", type=["jpg","jpeg","png"])
+with col1:
+    cam = st.camera_input("📷 Take a Photo")
+    upload = st.file_uploader("📁 Upload Image", type=["jpg", "jpeg", "png"])
 
-with right:
-    auto = st.checkbox("Auto-Save", value=True)
-    clear = st.button("Clear All Data")
+with col2:
+    auto = st.checkbox("Auto-Save to CSV", value=True)
+    clear = st.button("Clear All")
+
 
 if "cards" not in st.session_state:
     st.session_state.cards = []
 
-image_bytes = None
 
+image_bytes = None
 if cam:
     image_bytes = cam.getvalue()
 elif upload:
     image_bytes = upload.read()
 
-if image_bytes:
-    st.image(image_bytes, caption="Uploaded Image", use_column_width=True)
 
-    with st.spinner("🧠 DeepSeek OCR Reading..."):
+if image_bytes:
+    st.image(image_bytes, caption="Input Image", use_column_width=True)
+
+    with st.spinner("🧠 Reading with DeepSeek Vision..."):
         text = deepseek_ocr(image_bytes)
 
-    st.text_area("OCR Output", text, height=200)
+    st.text_area("📄 OCR Output", text, height=200)
 
     parsed = extract_v2(text)
     st.json(parsed)
 
     if auto:
         save_row(parsed)
-        st.success("Saved to CSV!")
+        st.success("Saved!")
 
     st.session_state.cards.append(parsed)
+
 
 if clear:
     st.session_state.cards = []
@@ -197,8 +215,10 @@ if clear:
     df.to_csv("scans.csv", index=False)
     st.success("All data cleared!")
 
+
+# ---------------- DISPLAY TABLE ----------------
 df = load_csv()
-st.subheader("📄 Saved Records")
+st.subheader("📚 Saved Records")
 st.dataframe(df, use_container_width=True)
 
 csv = df.to_csv(index=False).encode()
