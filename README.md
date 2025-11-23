@@ -1,30 +1,37 @@
-# Auto Business Card Scanner (EasyOCR)
+# Pro Business Card Scanner — EasyOCR + PaddleOCR ensemble
 
-This Streamlit app scans business cards using EasyOCR (no Google Cloud, no billing) and saves results into scans.csv.
+Features:
+- Auto-detects and crops business card from photo.
+- Ensemble OCR: EasyOCR + PaddleOCR (Paddle is optional; app falls back to EasyOCR).
+- Advanced extraction logic: Name, Company, Role, Phone, TollFree, Email, Website.
+- Auto-dedup and saves scans to scans.csv.
+- Test with your uploaded sample image (button provided).
 
-## Files
-- app.py
-- requirements.txt
-
-## How to run locally
-1. Create virtualenv:
+## Install & Run (locally)
+1. Create environment:
    python -m venv venv
-   source venv/bin/activate   # macOS/Linux
-   venv\Scripts\activate      # Windows
+   source venv/bin/activate    # macOS/Linux
+   venv\\Scripts\\activate     # Windows
 
 2. Install:
    pip install -r requirements.txt
+
+   NOTE: paddlepaddle may need a specific wheel for your OS. If installation fails, remove `paddleocr` and `paddlepaddle` from requirements and re-run pip install.
 
 3. Run:
    streamlit run app.py
 
 ## Deploy to Streamlit Cloud
-1. Push repository to GitHub.
-2. Create a new app on Streamlit Cloud and link the repo + branch.
-3. Use the default start command (streamlit run app.py).
-4. Allow camera permission in your browser. Click "Take photo" to capture the card (mobile browsers also work).
-5. Scans are appended automatically if they are unique.
+1. Push to GitHub.
+2. Create a Streamlit Cloud app pointing to this repo.
+3. Streamlit will install dependencies (may take longer because of easyocr/paddle).
+4. If paddlepaddle installation fails in Cloud, the app will still run using EasyOCR only.
 
-## Notes
-- This app uses snapshot captures (browser 'Take photo'). True continuous streaming requires WebRTC and reliable TURN servers which are not recommended for Streamlit Cloud.
-- If you want OCR quality improvements, I can add: perspective auto-crop, image enhancement, or a simple UI for selecting best OCR result per card.
+## Tips for best OCR
+- Good lighting, focused, flat card yields best results.
+- Use "Auto-detect & crop" to isolate the card before OCR (recommended).
+- If detection fails on very cluttered backgrounds, try a clean background or use upload.
+
+## Troubleshooting
+- If PaddleOCR fails to initialize, you'll see a message and app will use EasyOCR only.
+- If install for paddlepaddle times out on Streamlit Cloud, consider running locally or on a VPS (recommended for heavy workloads).
