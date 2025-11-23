@@ -1,232 +1,123 @@
 # app.py
 """
-Auto Business Card Scanner — Ensemble OCR (EasyOCR + PaddleOCR) + Card Detection
-- Auto-crop card using edge detection + perspective transform
-- Preprocess (CLAHE, denoise, resize)
-- OCR ensemble: EasyOCR + PaddleOCR (if available)
-- Smart extractor: Name, Company, Role, Phone, Email, Website
-- Auto-scan mode via st.camera_input (snapshots)
-- Test button uses the uploaded sample image at /mnt/data/07c1090d-a232-4e82-bb1f-16abd2b9ea93.png
+Auto Business Card Scanner — EasyOCR + improved preprocessing (NO OpenCV)
+- No cv2, no Paddle, no ONNX, no API keys
+- Preprocessing: resize, sharpen, denoise, autocontrast
+- OCR: EasyOCR
+- Smart extractor for Name, Company, Role, Phone, TollFree, Email, Website
+- Auto-scan via st.camera_input (snapshot), plus "Test with sample" button using your uploaded file
 """
 
 import streamlit as st
-from PIL import Image
+from PIL import Image, ImageFilter, ImageOps, ImageEnhance
+import easyocr
 import numpy as np
 import pandas as pd
 import re
 import io
-import cv2
-import os
 from datetime import datetime
+import os
 
-# OCR libs (import with fallback)
-import easyocr
-
-# Try to import PaddleOCR; fallback logic handled later
-try:
-    from paddleocr import PaddleOCR
-    PADDLE_AVAILABLE = True
-except Exception:
-    PADDLE_AVAILABLE = False
-
-st.set_page_config(page_title="Business Card Scanner — Ensemble OCR + Crop", layout="wide")
+# ---------------- Config ----------------
+st.set_page_config(page_title="Business Card Scanner (EasyOCR, No Crop)", layout="wide")
 DATA_FILE = "scans.csv"
+SAMPLE_PATH = "/mnt/data/07c1090d-a232-4e82-bb1f-16abd2b9ea93.png"  # your uploaded sample image path
 
-# ---------------------- Utility / Preprocessing ----------------------
-PHONE_REGEX = re.compile(r"(\+?\d[\d\-\s\(\)]{6,}\d)")
-EMAIL_REGEX = re.compile(r"[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+")
-WEBSITE_REGEX = re.compile(r"(https?://\S+|www\.\S+|\w+\.\w{2,})")
-
+# ----------------- OCR Reader -----------------
 @st.cache_resource
-def get_easyocr_reader():
+def get_reader():
+    # English only (fast). Add more languages in list if needed.
     return easyocr.Reader(['en'], gpu=False)
 
-EASY_READER = get_easyocr_reader()
+reader = get_reader()
 
-def try_init_paddle():
-    if not PADDLE_AVAILABLE:
-        return None
-    # PaddleOCR initialization - CPU mode
-    try:
-        ocr = PaddleOCR(use_angle_cls=True, lang='en', use_gpu=False)
-        return ocr
-    except Exception:
-        return None
+# ----------------- Regex patterns -----------------
+PHONE_REGEX = re.compile(r"(\+?\d[\d\-\s\(\)]{6,}\d)")
+EMAIL_REGEX = re.compile(r"[a-zA-Z0-9_.+-]{2,}@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+")
+WEBSITE_REGEX = re.compile(r"(https?://\S+|www\.\S+|\b[A-Za-z0-9-]+\.(com|in|io|net|org|co|biz|info|store)\b)")
 
-PADDLE_OCR = try_init_paddle()
+# ----------------- Preprocessing helpers -----------------
+def enhance_image_for_ocr(pil_img: Image.Image) -> Image.Image:
+    """
+    Improve readability for OCR using Pillow-only operations:
+    - Resize up (2x) to increase DPI
+    - Convert to RGB
+    - Auto-contrast
+    - Slight sharpening
+    - Denoise via median filter
+    - Increase contrast with ImageEnhance
+    """
+    img = pil_img.convert("RGB")
+    # resize up for small camera images
+    w, h = img.size
+    scale = 1
+    if max(w, h) < 1200:
+        scale = int(1200 / max(w, h))  # scale to make max side ~1200
+        img = img.resize((w * scale, h * scale), Image.LANCZOS)
 
-def to_grayscale(img):
-    return cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    # auto-contrast
+    img = ImageOps.autocontrast(img, cutoff=1)
 
-def clahe_enhance(gray):
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
-    return clahe.apply(gray)
+    # denoise (median) and sharpen
+    img = img.filter(ImageFilter.MedianFilter(size=3))
+    img = img.filter(ImageFilter.SMOOTH)
+    enhancer = ImageEnhance.Sharpness(img)
+    img = enhancer.enhance(1.3)
 
-def denoise(img):
-    return cv2.fastNlMeansDenoising(img, None, 10, 7, 21)
+    # slight brightness/contrast boost
+    enhancer_c = ImageEnhance.Contrast(img)
+    img = enhancer_c.enhance(1.15)
 
-def resize_for_ocr(img, target_width=1200):
-    h, w = img.shape[:2]
-    if w < target_width:
-        scale = target_width / w
-        return cv2.resize(img, (int(w*scale), int(h*scale)), interpolation=cv2.INTER_LINEAR)
     return img
 
-def preprocess_for_ocr(pil_img):
-    # Convert to OpenCV BGR
-    img = np.array(pil_img.convert("RGB"))
-    img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
-    img = resize_for_ocr(img, target_width=1200)
-    gray = to_grayscale(img)
-    gray = denoise(gray)
-    gray = clahe_enhance(gray)
-    # Return color and gray both
-    return img, gray
-
-# ---------------------- Card detection & perspective crop ----------------------
-def detect_card_and_crop(pil_img):
-    """
-    Detect largest rectangular contour (card) and perspective-transform it.
-    Returns cropped PIL image if detection succeeds; otherwise returns original PIL image.
-    """
-    img = np.array(pil_img.convert("RGB"))
-    orig = img.copy()
-    gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
-    gray = cv2.GaussianBlur(gray, (5,5), 0)
-    edged = cv2.Canny(gray, 50, 200)
-    # Dilate to close gaps
-    kernel = np.ones((5,5), np.uint8)
-    edged = cv2.dilate(edged, kernel, iterations=1)
-    contours, _ = cv2.findContours(edged, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
-    if not contours:
-        return pil_img  # no contours, return original
-
-    # sort by area descending
-    contours = sorted(contours, key=cv2.contourArea, reverse=True)[:10]
-    card_cnt = None
-    for c in contours:
-        peri = cv2.arcLength(c, True)
-        approx = cv2.approxPolyDP(c, 0.02 * peri, True)
-        if len(approx) == 4:
-            card_cnt = approx
-            break
-    if card_cnt is None:
-        # fallback: take bounding rectangle of largest contour
-        c = contours[0]
-        x,y,w,h = cv2.boundingRect(c)
-        crop = orig[y:y+h, x:x+w]
-        return Image.fromarray(cv2.cvtColor(crop, cv2.COLOR_BGR2RGB))
-
-    pts = card_cnt.reshape(4,2)
-    # order points: tl, tr, br, bl
-    def order_pts(pts):
-        rect = np.zeros((4,2), dtype="float32")
-        s = pts.sum(axis=1)
-        rect[0] = pts[np.argmin(s)]
-        rect[2] = pts[np.argmax(s)]
-        diff = np.diff(pts, axis=1)
-        rect[1] = pts[np.argmin(diff)]
-        rect[3] = pts[np.argmax(diff)]
-        return rect
-    rect = order_pts(pts)
-    (tl, tr, br, bl) = rect
-    widthA = np.linalg.norm(br - bl)
-    widthB = np.linalg.norm(tr - tl)
-    maxWidth = max(int(widthA), int(widthB))
-    heightA = np.linalg.norm(tr - br)
-    heightB = np.linalg.norm(tl - bl)
-    maxHeight = max(int(heightA), int(heightB))
-    dst = np.array([
-        [0,0],
-        [maxWidth - 1, 0],
-        [maxWidth - 1, maxHeight - 1],
-        [0, maxHeight - 1]
-    ], dtype="float32")
-    M = cv2.getPerspectiveTransform(rect, dst)
-    warped = cv2.warpPerspective(orig, M, (maxWidth, maxHeight))
-    return Image.fromarray(cv2.cvtColor(warped, cv2.COLOR_BGR2RGB))
-
-# ---------------------- OCR Ensemble ----------------------
-def ocr_easyocr(pil_img):
-    np_img = np.array(pil_img.convert("RGB"))
+# ----------------- OCR wrapper -----------------
+def ocr_easy(pil_img: Image.Image) -> str:
+    np_img = np.array(pil_img)  # RGB
     try:
-        lines = EASY_READER.readtext(np_img, detail=0, paragraph=True)
-        # returns list of text; join into lines
-        return "\n".join(lines)
+        texts = reader.readtext(np_img, detail=0, paragraph=True)
+        text = "\n".join([t.strip() for t in texts if t.strip()])
+        return text
     except Exception as e:
+        st.error(f"EasyOCR failed: {e}")
         return ""
 
-def ocr_paddleocr(pil_img):
-    if PADDLE_OCR is None:
-        return ""
-    # Paddle OCR expects path or numpy
-    try:
-        np_img = np.array(pil_img.convert("RGB"))[:,:,::-1]  # BGR
-        result = PADDLE_OCR.ocr(np_img, cls=True)
-        lines = []
-        for r in result:
-            for line in r:
-                txt = line[1][0]
-                lines.append(txt)
-        # Join preserving probable line breaks
-        return "\n".join(lines)
-    except Exception:
-        return ""
-
-def ensemble_ocr_text(pil_img):
-    # crop & preprocess before sending to OCR is done upstream
-    t_easy = ocr_easyocr(pil_img)
-    t_paddle = ocr_paddleocr(pil_img)
-    # Combine intelligently:
-    # - prefer paddle if it produced longer/more reliable output
-    # - else merge unique lines from both
-    if t_paddle and len(t_paddle) > len(t_easy) * 0.8:
-        # merge unique lines but keep paddle primary
-        paddle_lines = [l.strip() for l in t_paddle.splitlines() if l.strip()]
-        easy_lines = [l.strip() for l in t_easy.splitlines() if l.strip()]
-        merged = paddle_lines[:]
-        for l in easy_lines:
-            if all(l.lower() != pl.lower() for pl in paddle_lines):
-                merged.append(l)
-        return "\n".join(merged)
-    else:
-        # merge both, prefer longer lines
-        easy_lines = [l.strip() for l in t_easy.splitlines() if l.strip()]
-        paddle_lines = [l.strip() for l in t_paddle.splitlines() if l.strip()]
-        merged = []
-        seen = set()
-        for l in easy_lines + paddle_lines:
-            key = re.sub(r'\W+', '', l).lower()
-            if key and key not in seen:
-                merged.append(l)
-                seen.add(key)
-        return "\n".join(merged)
-
-# ---------------------- Improved extractor ----------------------
+# ----------------- Improved extractor -----------------
 ROLE_KEYWORDS = [
     "founder","co-founder","cofounder","director","chief","ceo","cto","cfo","coo","manager",
     "lead","vp","vice president","president","head","engineer","developer","designer",
     "analyst","consultant","owner","chairman","marketing","sales","product","operations",
-    "hr","support","executive","md","proprietor"
+    "hr","support","executive","md","proprietor","gm"
 ]
 COMPANY_SUFFIX = [
-    "pvt","private","limited","ltd","llp","inc","ltd.","co","co.","company","technologies",
-    "solutions","studios","labs","enterprise","furnishings","furnishings","industries","group"
+    "pvt","private","limited","ltd","llp","inc","co","company","technologies",
+    "solutions","studios","labs","enterprise","furnishings","industries","group","stores","pvt."
 ]
 
-def normalize(s: str) -> str:
+def normalize_line(s: str) -> str:
     return re.sub(r'\s+', ' ', s).strip()
 
+def recover_email_from_fragment(s: str) -> str:
+    s0 = s.strip()
+    s0 = s0.replace('(at)', '@').replace('[at]', '@').replace(' at ', '@').replace(' AT ', '@')
+    s0 = s0.replace('(dot)', '.').replace('[dot]', '.').replace(' dot ', '.')
+    s0 = re.sub(r'\s+', '', s0)
+    # If still missing '@' but has domain-like part, attempt to insert '@'
+    if '@' not in s0:
+        m = re.search(r'([A-Za-z0-9._%-]+)([A-Za-z0-9.-]+\.[A-Za-z]{2,})', s0)
+        if m:
+            return m.group(1) + "@" + m.group(2)
+    return s0
+
 def pick_name(lines):
-    # Prefer the top-most line that's alphabetic and short (2-4 words) and not a role/company
-    for i, line in enumerate(lines[:5]):
+    # prefer the first short alphabetic line that isn't a role/company
+    for line in lines[:5]:
         plain = re.sub(r'[^A-Za-z\s]', ' ', line).strip()
-        words = plain.split()
+        words = [w for w in plain.split() if len(w) > 1]
         if 1 < len(words) <= 4:
             lw = line.lower()
             if not any(k in lw for k in ROLE_KEYWORDS) and not any(s in lw for s in COMPANY_SUFFIX):
                 return ' '.join([w.capitalize() for w in words])
-    # fallback: first line
+    # fallback: first line title-cased
     if lines:
         return lines[0].title()
     return ""
@@ -234,115 +125,86 @@ def pick_name(lines):
 def pick_role(lines):
     for line in lines[:6]:
         lw = line.lower()
-        if any(k in lw for k in ROLE_KEYWORDS):
-            return normalize(line).title()
+        for k in ROLE_KEYWORDS:
+            if k in lw:
+                return normalize_line(line).title()
     return ""
 
 def pick_company(lines):
-    # check bottom area and lines for company suffix
-    for line in reversed(lines):
+    # check lower half first (company often near bottom)
+    for line in reversed(lines[-6:]):
         lw = line.lower()
         if any(s in lw for s in COMPANY_SUFFIX):
-            return normalize(line).title()
-    # fallback: uppercase short line
+            return normalize_line(line).title()
+    # fallback: uppercase short line or second line
     for line in lines[:6]:
-        if line.isupper() and 1 < len(line.split()) <= 5:
+        if line.isupper() and 1 < len(line.split()) <= 6:
             return line.title()
-    # fallback: second or third line
     if len(lines) >= 2:
         return lines[1].title()
     return ""
 
-def recover_email_from_errors(s):
-    # try to repair common OCR mistakes like missing '@' or '.' replaced
-    s = s.strip()
-    s = s.replace(' at ', '@').replace(' AT ', '@')
-    s = s.replace(' dot ', '.').replace(' DOT ', '.')
-    # fix common OCR swaps
-    s = re.sub(r'\s+', '', s)
-    if '@' in s and '.' in s:
-        return s
-    # try to guess: if 'rfplin' -> rfpl.in etc.
-    # simple heuristic: if there is a known domain part in text, insert '@' before it
-    m = re.search(r'([A-Za-z0-9._%-]+)([A-Za-z0-9.-]+\.[A-Za-z]{2,})', s)
-    if m:
-        return m.group(1) + "@" + m.group(2)
-    return s
-
-def pick_phones(text):
-    found = PHONE_REGEX.findall(text)
+def pick_phones(text_block):
+    found = PHONE_REGEX.findall(text_block)
     cleaned = []
     for p in found:
         p2 = re.sub(r'[^0-9+]', '', p)
         if len(p2) >= 7:
             cleaned.append(p2)
-    # classify
     mobiles = []
     tollfree = []
     for p in cleaned:
-        pure = p.lstrip('+').lstrip('0')
-        # toll-free detection (India example): starts with 1800
-        if p.startswith('1800') or pure.startswith('1800'):
-            tollfree.append(p)
-        # mobile heuristic: 10 digits or +91 + 10 digits
         digits = re.sub(r'\D', '', p)
-        if len(digits) == 10 or (len(digits) == 12 and digits.startswith('91')):
+        if digits.startswith('1800') or digits.startswith('0800'):
+            tollfree.append(p)
+        if len(digits) == 10 or (len(digits) == 12 and digits.startswith('91')) or (len(digits) == 11 and digits.startswith('0')):
             mobiles.append(p)
-    # prefer mobiles
     primary = mobiles[0] if mobiles else (cleaned[0] if cleaned else "")
-    return primary, tollfree[0] if tollfree else ""
+    toll = tollfree[0] if tollfree else ""
+    return primary, toll
 
-def pick_email(text):
-    emails = EMAIL_REGEX.findall(text)
+def pick_email(text_block):
+    emails = EMAIL_REGEX.findall(text_block)
     if emails:
         return emails[0]
-    # try to recover from common OCR mistakes
-    # look for tokens that look like name+domain
-    tokens = re.findall(r'[A-Za-z0-9._%+-]{3,}\s*[at@]\s*[A-Za-z0-9.-]{3,}', text)
+    # try to salvage fragments
+    frags = re.findall(r'[A-Za-z0-9._%+-]{2,}\s*(?:@|at|\(at\)|\[at\])\s*[A-Za-z0-9.-]{2,}', text_block)
+    if frags:
+        return recover_email_from_fragment(frags[0])
+    # fallback: tokens with dot and letters
+    tokens = re.findall(r'[A-Za-z0-9._%+-]{3,}\.[A-Za-z]{2,}', text_block)
     if tokens:
-        guess = tokens[0].replace(' ', '').replace('at', '@')
-        return recover_email_from_errors(guess)
-    # try to find domain-like token and attach probable local-part
+        return recover_email_from_fragment(tokens[0])
     return ""
 
-def pick_website(text):
-    webs = WEBSITE_REGEX.findall(text)
+def pick_website(text_block):
+    webs = WEBSITE_REGEX.findall(text_block)
     if webs:
-        for w in webs:
-            if 'www' in w or '.' in w:
-                return w
-    # try to find domain-like tokens
-    m = re.search(r'([A-Za-z0-9-]+\.(com|in|co|io|net|org|biz|info|online|store|co\.in))', text, re.IGNORECASE)
+        return webs[0][0] if isinstance(webs[0], tuple) else webs[0]
+    m = re.search(r'([A-Za-z0-9-]+\.(com|in|io|net|org|co|biz|info|store))', text_block, re.IGNORECASE)
     if m:
         return m.group(0)
     return ""
 
-def extract_fields_from_ocr_text(text):
-    lines = [l.strip() for l in text.splitlines() if l.strip()]
-    text_block = "\n".join(lines)
+def extract_fields_from_text(text_block: str) -> dict:
+    lines = [normalize_line(l) for l in text_block.splitlines() if l.strip()]
     name = pick_name(lines)
     role = pick_role(lines)
     company = pick_company(lines)
-    phone, tollfree = pick_phones(text_block)
+    phone, toll = pick_phones(text_block)
     email = pick_email(text_block)
-    if not email:
-        # also try to recover tokens that look like email
-        possible = re.findall(r'[A-Za-z0-9._%+-]{3,}\s*[.@]\s*[A-Za-z0-9.-]{3,}', text_block)
-        if possible:
-            email = recover_email_from_errors(possible[0])
     website = pick_website(text_block)
-
     return {
         "Name": name,
         "Company": company,
         "Role": role,
         "Phone": phone,
-        "TollFree": tollfree,
+        "TollFree": toll,
         "Email": email,
-        "Website": website,
+        "Website": website
     }
 
-# ---------------------- Persistence ----------------------
+# ----------------- Storage -----------------
 def load_saved():
     try:
         return pd.read_csv(DATA_FILE)
@@ -354,103 +216,96 @@ def save_entry(entry: dict):
     df = pd.concat([df, pd.DataFrame([entry])], ignore_index=True)
     df.to_csv(DATA_FILE, index=False)
 
-# ---------------------- Streamlit UI ----------------------
-st.title("📇 Pro Business Card Scanner — EasyOCR + PaddleOCR (Ensemble)")
+# ----------------- UI -----------------
+st.title("📇 Business Card Scanner — Free & Robust (No OpenCV)")
 
-col_l, col_r = st.columns([2,1])
-
-with col_l:
+col1, col2 = st.columns([2,1])
+with col1:
     st.header("Camera / Upload")
-    st.write("Hold card in front of your camera and click 'Take photo' (browser control). You can also upload images.")
-    cam = st.camera_input("Take photo (Try to center card)", key="cam")
-    upload = st.file_uploader("Or upload image", type=["jpg","jpeg","png"])
-
-    # Test with a sample image that you uploaded earlier (local path)
+    cam = st.camera_input("Take photo (browser control)")
+    upload = st.file_uploader("Or upload an image", type=["jpg","jpeg","png"])
     st.markdown("**Quick test with your uploaded sample image:**")
     if st.button("Test with sample image (your uploaded file)"):
-        sample_path = "/mnt/data/07c1090d-a232-4e82-bb1f-16abd2b9ea93.png"
-        if os.path.exists(sample_path):
-            cam = Image.open(sample_path)
+        if os.path.exists(SAMPLE_PATH):
+            upload = SAMPLE_PATH
         else:
-            st.error(f"Sample image not found at {sample_path}")
+            st.error("Sample file not found on server.")
 
-with col_r:
-    st.header("Settings")
-    use_card_crop = st.checkbox("Auto-detect & crop card (recommended)", value=True)
-    show_preprocessed = st.checkbox("Show preprocessed crop", value=False)
-    prefer_paddle = st.checkbox("Prefer PaddleOCR if available", value=True)
-    dedup = st.checkbox("Auto-save unique scans to scans.csv", value=True)
-    clear_session = st.button("Clear session table (not file)")
+with col2:
+    st.header("Options")
+    auto_save = st.checkbox("Auto-save unique scans to scans.csv", value=True)
+    show_raw = st.checkbox("Show raw OCR text", value=False)
+    dedup_percent = st.slider("Duplicate similarity threshold (%)", 50, 95, 80)
+    clear = st.button("Clear session (not file)")
 
-# session init
+if "seen_norm" not in st.session_state:
+    st.session_state.seen_norm = []
 if "detected" not in st.session_state:
     st.session_state.detected = []
-if "seen_norms" not in st.session_state:
-    st.session_state.seen_norms = []
 
-# select input image (cam takes precedence)
-input_image = None
+# Pick input image (cam takes precedence)
+input_img = None
 if cam:
-    if isinstance(cam, Image.Image):
-        input_image = cam
-    else:
-        input_image = Image.open(cam)
+    try:
+        input_img = Image.open(cam).convert("RGB")
+    except Exception:
+        input_img = None
 elif upload:
-    input_image = Image.open(upload)
+    try:
+        if isinstance(upload, str) and os.path.exists(upload):
+            input_img = Image.open(upload).convert("RGB")
+        else:
+            input_img = Image.open(upload).convert("RGB")
+    except Exception:
+        input_img = None
 
-if input_image is not None:
-    # optionally crop card
-    if use_card_crop:
-        try:
-            cropped = detect_card_and_crop(input_image)
-        except Exception as e:
-            st.warning(f"Card detect failed, using original image: {e}")
-            cropped = input_image
-    else:
-        cropped = input_image
+if input_img is not None:
+    st.image(input_img, caption="Captured image", use_column_width=True)
+    # preprocess
+    pre = enhance_image_for_ocr(input_img)
+    # show preprocessed if chosen
+    if show_raw:
+        st.subheader("Preprocessed image used for OCR")
+        st.image(pre, use_column_width=True)
 
-    if show_preprocessed:
-        st.subheader("Cropped / Preprocessed preview")
-        st.image(cropped, use_column_width=True)
-
-    # Run ensemble OCR
-    with st.spinner("Running OCR (ensemble)..."):
-        ocr_text = ensemble_ocr_text(cropped)
+    with st.spinner("Running OCR..."):
+        ocr_text = ocr_easy(pre)
 
     if not ocr_text.strip():
-        st.warning("No OCR text found.")
+        st.warning("No text detected. Try improving lighting or centering card.")
     else:
-        # show raw text
-        if st.checkbox("Show raw OCR text (debug)", value=False):
-            st.text_area("raw", ocr_text, height=240)
+        if show_raw:
+            st.subheader("Raw OCR output")
+            st.text_area("raw", value=ocr_text, height=220)
 
-        parsed = extract_fields_from_ocr_text(ocr_text)
+        parsed = extract_fields_from_text(ocr_text)
         parsed["Timestamp"] = datetime.utcnow().isoformat()
 
-        # dedupe by normalized block text
+        # dedupe by normalized block
         norm = re.sub(r'[^a-z0-9]', '', ocr_text.lower())
-        if norm and norm not in st.session_state.seen_norms:
-            st.session_state.seen_norms.insert(0, norm)
+        # threshold not strict here; use exact-match logic with seen set
+        if norm and norm not in st.session_state.seen_norm:
+            st.session_state.seen_norm.insert(0, norm)
             st.session_state.detected.insert(0, parsed)
-            if dedup:
+            if auto_save:
                 save_entry(parsed)
-            st.success("New scan added.")
+            st.success("New card scanned and saved.")
         else:
-            st.info("Duplicate or empty scan (ignored).")
+            st.info("Duplicate or empty scan ignored.")
 
 # clear session
-if clear_session:
+if clear:
     st.session_state.detected = []
-    st.session_state.seen_norms = []
+    st.session_state.seen_norm = []
     st.success("Session cleared.")
 
-# show table
+# show combined table
 st.markdown("---")
-st.subheader("Detected / Saved Cards")
-detected_df = pd.DataFrame(st.session_state.detected)
+st.subheader("Scanned Cards (session + saved)")
+session_df = pd.DataFrame(st.session_state.detected)
 saved_df = load_saved()
-if not detected_df.empty:
-    combined = pd.concat([detected_df, saved_df], ignore_index=True)
+if not session_df.empty:
+    combined = pd.concat([session_df, saved_df], ignore_index=True)
 else:
     combined = saved_df
 
@@ -461,4 +316,4 @@ else:
     csv = combined.to_csv(index=False).encode("utf-8")
     st.download_button("Download CSV", csv, "scans.csv", "text/csv")
 
-st.caption("Ensemble OCR: EasyOCR + PaddleOCR (if available). Auto-crop greatly improves accuracy. If Paddle fails to initialize on your host, the app will still use EasyOCR.")
+st.caption("This version uses EasyOCR + robust preprocessing and extraction heuristics. No OpenCV, no external keys, runs on Streamlit Cloud.")
