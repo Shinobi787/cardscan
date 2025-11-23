@@ -28,7 +28,7 @@ def deepseek_vision_ocr(image_bytes):
             {
                 "role": "user",
                 "content": [
-                    {"type": "input_text", "text": "Extract ONLY the raw text from this business card. No explanations. No formatting."},
+                    {"type": "input_text", "text": "Extract ONLY all raw text from this business card. No formatting. No explanation."},
                     {
                         "type": "input_image",
                         "image_url": f"data:image/png;base64,{encoded_image}"
@@ -78,56 +78,39 @@ COMP_SUFFIX = [
 ]
 
 
-# ---------------- EXTRACTION V3 (AI + Rules) ----------------
+# ---------------- EXTRACTION V3 ----------------
 def extract_v3(text):
-    """
-    Hybrid extraction:
-    - Regex and rule-based extraction
-    - PLUS AI cleaning & correction via DeepSeek
-    """
-
-    # 1) Rule-based parsing (from V2)
     lines = [l.strip() for l in text.split("\n") if l.strip()]
     block = " ".join(lines)
 
-    # PHONE
+    # Regex-based extraction
     phones = PHONE_REGEX.findall(block)
     phones = [re.sub(r"[^0-9+]", "", p) for p in phones]
-    primary = secondary = ""
+    primary = phones[0] if phones else ""
+    secondary = phones[1] if len(phones) > 1 else ""
 
-    for p in phones:
-        digits = re.sub(r"\D", "", p)
-        if len(digits) >= 10:
-            if not primary:
-                primary = p
-            else:
-                secondary = p
-
-    # EMAIL
     emails = EMAIL_REGEX.findall(block)
     email = emails[0] if emails else ""
 
-    # WEBSITE
     webs = WEBSITE_REGEX.findall(block)
     website = webs[0][0] if isinstance(webs[0], tuple) else webs[0] if webs else ""
 
-    # 2) AI-based field correction
+    # AI-based correction
     correction_prompt = f"""
-    The following text was extracted from a business card:
+    Text extracted from a business card:
 
     {text}
 
-    Extract these fields accurately:
-    - Full Name
-    - Company Name
-    - Role / Position
-    - Primary Phone
-    - Secondary Phone
-    - Email
-    - Website
-
-    Respond ONLY in valid JSON with keys:
-    name, company, role, phone1, phone2, email, website
+    Extract fields as JSON:
+    {{
+      "name": "",
+      "company": "",
+      "role": "",
+      "phone1": "",
+      "phone2": "",
+      "email": "",
+      "website": ""
+    }}
     """
 
     payload = {
@@ -143,25 +126,12 @@ def extract_v3(text):
 
     try:
         r = requests.post(API_URL, headers=headers, json=payload)
-        j = r.json()
-        raw = j["choices"][0]["message"]["content"]
+        raw_json = r.json()["choices"][0]["message"]["content"]
     except:
-        # fallback to rule-based only
-        return {
-            "Name": "",
-            "Company": "",
-            "Role": "",
-            "PhonePrimary": primary,
-            "PhoneSecondary": secondary,
-            "Email": email,
-            "Website": website,
-            "RawText": text,
-            "Timestamp": datetime.utcnow().isoformat()
-        }
+        raw_json = "{}"
 
-    # Parse JSON from DeepSeek
     try:
-        ai = eval(raw)  # safe because DeepSeek returns pure JSON
+        ai = eval(raw_json)  # safe: DeepSeek returns pure JSON-style text
     except:
         ai = {}
 
@@ -183,8 +153,7 @@ def load_csv():
     try:
         return pd.read_csv("scans.csv")
     except:
-        cols = ["Name","Company","Role","PhonePrimary","PhoneSecondary",
-                "Email","Website","RawText","Timestamp"]
+        cols = ["Name","Company","Role","PhonePrimary","PhoneSecondary","Email","Website","RawText","Timestamp"]
         return pd.DataFrame(columns=cols)
 
 def save_row(row):
@@ -195,15 +164,15 @@ def save_row(row):
 
 # ---------------- UI ----------------
 
-st.title("📇 Business Card Scanner — DeepSeek Vision OCR (V3 AI Enhanced)")
+st.title("📇 Business Card Scanner — DeepSeek Vision V3 (AI Enhanced)")
 
-left, right = st.columns([2,1])
+col1, col2 = st.columns([2, 1])
 
-with left:
+with col1:
     cam = st.camera_input("📷 Take Photo of Business Card")
     upload = st.file_uploader("📁 Upload Business Card", type=["png","jpg","jpeg"])
 
-with right:
+with col2:
     auto = st.checkbox("Auto-Save to CSV", value=True)
     clear = st.button("Clear All Records")
 
@@ -217,8 +186,8 @@ elif upload:
 if image_bytes:
     st.image(image_bytes, caption="Card Image", use_column_width=True)
 
-    with st.spinner("🧠 DeepSeek Vision Extracting Text..."):
-        raw_text = deepseek_ocr(image_bytes)
+    with st.spinner("🧠 Extracting text using DeepSeek Vision..."):
+        raw_text = deepseek_vision_ocr(image_bytes)
 
     st.text_area("📄 OCR Output", raw_text, height=200)
 
@@ -227,7 +196,7 @@ if image_bytes:
 
     if auto:
         save_row(parsed)
-        st.success("Saved Successfully!")
+        st.success("Saved!")
 
 if clear:
     df = load_csv()
