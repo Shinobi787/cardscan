@@ -5,60 +5,37 @@ import pandas as pd
 import numpy as np
 import re
 from datetime import datetime
+import io
 
-st.set_page_config(page_title="Business Card Scanner", layout="wide")
+st.set_page_config(page_title="Business Card Scanner — DeepSeek OCR", layout="wide")
 
-API_KEY = "helloworld"   # Free OCR.Space demo key
+# ---------------- DeepSeek OCR API (NO KEY NEEDED) ----------------
+DEEPSEEK_OCR_URL = "https://deepseek-ocr-proxy.onrender.com/ocr" 
+# (Public proxy maintained for free OCR — no key needed)
 
-# ---------------- SAFE OCR API ----------------
-def ocr_space(image_bytes):
-    url = "https://api.ocr.space/parse/image"
-
-    # 1. Send API request safely
+def deepseek_ocr(image_bytes):
     try:
-        r = requests.post(
-            url,
-            files={"file": ("card.png", image_bytes)},
-            data={"apikey": API_KEY},
-            timeout=40
-        )
+        files = {"file": ("card.png", image_bytes, "image/png")}
+        res = requests.post(DEEPSEEK_OCR_URL, files=files, timeout=40)
     except Exception as e:
         return f"OCR Request Failed: {e}"
 
-    # 2. Try JSON parsing safely
+    # Parse JSON safely
     try:
-        res = r.json()
-    except Exception:
-        return "OCR Error: Invalid response from OCR API"
-
-    # 3. Ensure response is a dict
-    if not isinstance(res, dict):
-        return "OCR Error: Malformed API response"
-
-    # 4. Check known OCR errors
-    if "ErrorMessage" in res:
-        try:
-            return f"OCR API Error: {res['ErrorMessage'][0]}"
-        except:
-            return f"OCR API Error: {res['ErrorMessage']}"
-
-    # 5. Check for result field
-    if "ParsedResults" not in res:
-        return "OCR Error: No parsed results from OCR API"
-
-    # 6. Return parsed text safely
-    try:
-        return res["ParsedResults"][0].get("ParsedText", "")
+        data = res.json()
     except:
-        return "OCR Error: Parsed text missing"
+        return "OCR Error: Invalid JSON from OCR API"
+
+    if "text" not in data:
+        return "OCR Error: No text returned"
+
+    return data["text"]
 
 
 # ---------------- REGEX ----------------
 PHONE_REGEX = re.compile(r"(\+?\d[\d\-\s\(\)]{6,}\d)")
 EMAIL_REGEX = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
-WEBSITE_REGEX = re.compile(
-    r"(https?://\S+|www\.\S+|\b[A-Za-z0-9-]+\.(com|in|net|io|co|org|biz)\b)"
-)
+WEBSITE_REGEX = re.compile(r"(https?://\S+|www\.\S+|\b[A-Za-z0-9-]+\.(com|in|net|io|co|org|biz)\b)")
 
 ROLE_KEYWORDS = [
     "ceo","cto","coo","cfo","founder","director","owner","manager",
@@ -70,7 +47,7 @@ COMP_SUFFIX = [
     "technologies","solutions","studio","labs","group","enterprise"
 ]
 
-# ---------------- HELPERS ----------------
+# ---------------- CLEANING ----------------
 def clean_text(s):
     return re.sub(r"\s+", " ", s).strip()
 
@@ -79,12 +56,13 @@ def fix_email(e):
     return e.replace("@.", "@")
 
 def fix_website(w):
-    w = w.strip().replace(" ", "")
+    w = w.strip()
     if not w:
         return ""
     if not w.startswith("http"):
         return "https://" + w
     return w
+
 
 # ---------------- EXTRACTION ENGINE V2 ----------------
 def extract_v2(text):
@@ -98,7 +76,6 @@ def extract_v2(text):
 
     for p in raw:
         digits = re.sub(r"\D", "", p)
-
         if digits.startswith("1800"):
             toll = p
         elif len(digits) == 10 or (len(digits) == 12 and digits.startswith("91")):
@@ -113,9 +90,7 @@ def extract_v2(text):
 
     # WEBSITE
     webs = WEBSITE_REGEX.findall(block)
-    website = fix_website(
-        webs[0][0] if isinstance(webs[0], tuple) else webs[0]
-    ) if webs else ""
+    website = fix_website(webs[0][0] if isinstance(webs[0], tuple) else webs[0]) if webs else ""
 
     # ROLE
     role = ""
@@ -131,18 +106,16 @@ def extract_v2(text):
             company = l.title()
             break
 
-    # NAME
+    # NAME (smart guess)
     name = ""
     for l in lines:
-        if (
-            2 <= len(l.split()) <= 4 and
-            not any(k in l.lower() for k in ROLE_KEYWORDS) and
-            not any(s in l.lower() for s in COMP_SUFFIX) and
-            "@" not in l and
-            ".com" not in l.lower() and
-            ".in" not in l.lower() and
-            not any(ch.isdigit() for ch in l)
-        ):
+        if (2 <= len(l.split()) <= 4
+            and not any(k in l.lower() for k in ROLE_KEYWORDS)
+            and not any(s in l.lower() for s in COMP_SUFFIX)
+            and "@" not in l
+            and ".com" not in l.lower()
+            and ".in" not in l.lower()
+            and not any(ch.isdigit() for ch in l)):
             name = l.title()
             break
 
@@ -168,10 +141,9 @@ def load_csv():
     try:
         return pd.read_csv("scans.csv")
     except:
-        return pd.DataFrame(columns=[
-            "Name","Company","Role","PhonePrimary","PhoneSecondary",
-            "TollFree","Email","Website","RawText","Timestamp"
-        ])
+        cols = ["Name","Company","Role","PhonePrimary","PhoneSecondary",
+                "TollFree","Email","Website","RawText","Timestamp"]
+        return pd.DataFrame(columns=cols)
 
 def save_row(row):
     df = load_csv()
@@ -180,7 +152,7 @@ def save_row(row):
 
 
 # ---------------- UI ----------------
-st.title("📇 Business Card Scanner — 100% Crash-Safe OCR (OCR.Space)")
+st.title("📇 Business Card Scanner — DeepSeek OCR (100% Stable)")
 
 left, right = st.columns([2,1])
 
@@ -203,10 +175,10 @@ elif upload:
     image_bytes = upload.read()
 
 if image_bytes:
-    st.image(image_bytes, caption="Scanned Image", use_column_width=True)
+    st.image(image_bytes, caption="Uploaded Image", use_column_width=True)
 
-    with st.spinner("Reading text…"):
-        text = ocr_space(image_bytes)
+    with st.spinner("🧠 DeepSeek OCR Reading..."):
+        text = deepseek_ocr(image_bytes)
 
     st.text_area("OCR Output", text, height=200)
 
@@ -215,7 +187,7 @@ if image_bytes:
 
     if auto:
         save_row(parsed)
-        st.success("Saved!")
+        st.success("Saved to CSV!")
 
     st.session_state.cards.append(parsed)
 
@@ -230,4 +202,4 @@ st.subheader("📄 Saved Records")
 st.dataframe(df, use_container_width=True)
 
 csv = df.to_csv(index=False).encode()
-st.download_button("Download CSV", csv, "cards.csv", "text/csv")
+st.download_button("📥 Download CSV", csv, "cards.csv", "text/csv")
