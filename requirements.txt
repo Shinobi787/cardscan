@@ -1,7 +1,6 @@
 streamlit
-streamlit-webrtc
-google-cloud-vision
 pillow
-pandas
-numpy
+easyocr
 opencv-python-headless
+numpy
+pandas
