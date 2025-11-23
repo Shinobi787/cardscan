@@ -1,8 +1,5 @@
 streamlit
 pillow
 easyocr
-paddleocr
-paddlepaddle
-opencv-python-headless
 numpy
 pandas
