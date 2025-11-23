@@ -1,4 +1,7 @@
 streamlit
+streamlit-webrtc
+google-cloud-vision
 pillow
 pandas
-google-cloud-vision
+numpy
+opencv-python-headless
