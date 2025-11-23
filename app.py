@@ -9,6 +9,8 @@ import os
 from datetime import datetime
 import tempfile
 import io
+import threading
+from typing import List, Dict, Any
 
 # Try to import PaddleOCR (optional)
 try:
@@ -16,7 +18,14 @@ try:
     PADDLE_AVAILABLE = True
 except ImportError:
     PADDLE_AVAILABLE = False
-    st.warning("PaddleOCR not available. Using EasyOCR only.")
+
+# Try to import streamlit-webrtc for live camera
+try:
+    from streamlit_webrtc import webrtc_streamer, VideoTransformerBase, RTCConfiguration, WebRtcMode
+    WEBRTC_AVAILABLE = True
+except ImportError:
+    WEBRTC_AVAILABLE = False
+    st.warning("streamlit-webrtc not available. Live camera disabled.")
 
 # Page config
 st.set_page_config(
@@ -28,6 +37,7 @@ st.set_page_config(
 # Configuration
 DATA_FILE = "scans.csv"
 MIN_TEXT_LENGTH = 10
+OCR_EVERY_N_FRAMES = 30  # Process every 30th frame (~1-2 seconds)
 
 # Regex patterns for field extraction
 PHONE_REGEX = re.compile(r'(\+?\d[\d\s\-\(\)]{7,}\d)')
@@ -35,19 +45,35 @@ TOLLFREE_REGEX = re.compile(r'\b(1?[-\s]?(800|888|877|866|855)[-\s]?\d{3}[-\s]?\
 EMAIL_REGEX = re.compile(r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b')
 WEBSITE_REGEX = re.compile(r'(https?://[^\s]+|www\.[^\s]+|\b[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b)')
 
+# Global state for live camera results
+if 'live_scans' not in st.session_state:
+    st.session_state.live_scans = []
+if 'camera_active' not in st.session_state:
+    st.session_state.camera_active = False
+
+scan_lock = threading.Lock()
+
+@st.cache_resource
 def init_ocr():
-    """Initialize OCR readers"""
+    """Initialize OCR readers - cached to load only once"""
+    st.info("🔄 Loading OCR models... This may take a minute.")
+    
     # Initialize EasyOCR
-    easy_reader = easyocr.Reader(['en'])
+    try:
+        easy_reader = easyocr.Reader(['en'])
+        st.success("✅ EasyOCR loaded successfully!")
+    except Exception as e:
+        st.error(f"❌ EasyOCR failed to load: {str(e)}")
+        return None, None
     
     # Initialize PaddleOCR if available
     paddle_reader = None
     if PADDLE_AVAILABLE:
         try:
             paddle_reader = PaddleOCR(use_angle_cls=True, lang='en')
-            st.success("PaddleOCR initialized successfully!")
+            st.success("✅ PaddleOCR loaded successfully!")
         except Exception as e:
-            st.warning(f"PaddleOCR initialization failed: {str(e)}")
+            st.warning(f"⚠️ PaddleOCR initialization failed: {str(e)}")
             paddle_reader = None
     
     return easy_reader, paddle_reader
@@ -150,7 +176,8 @@ def extract_fields_from_text(text):
         'TollFree': '',
         'Email': '',
         'Website': '',
-        'RawText': text
+        'RawText': text,
+        'Source': 'upload'
     }
     
     if not lines:
@@ -252,22 +279,23 @@ def save_scan(data):
     
     df.to_csv(DATA_FILE, index=False)
 
-def process_image(image, easy_reader, paddle_reader, auto_crop=True):
+def process_image(image, easy_reader, paddle_reader, auto_crop=True, source="upload"):
     """Process image and extract business card data"""
-    # Convert PIL to OpenCV
-    image_cv = np.array(image)
-    image_cv = cv2.cvtColor(image_cv, cv2.COLOR_RGB2BGR)
+    # Convert PIL to OpenCV if needed
+    if isinstance(image, Image.Image):
+        image_cv = np.array(image)
+        image_cv = cv2.cvtColor(image_cv, cv2.COLOR_RGB2BGR)
+    else:
+        image_cv = image
     
     # Auto-crop if enabled
+    original_image = image_cv.copy()
     if auto_crop:
         cropped_image, success = auto_crop_card(image_cv)
         if success:
             image_cv = cropped_image
-            st.success("✅ Card auto-detected and cropped!")
-        else:
-            st.warning("⚠️ Could not auto-detect card. Using full image.")
     
-    # Convert back to RGB for display
+    # Convert to RGB for display and OCR
     image_rgb = cv2.cvtColor(image_cv, cv2.COLOR_BGR2RGB)
     
     # Run ensemble OCR
@@ -275,133 +303,272 @@ def process_image(image, easy_reader, paddle_reader, auto_crop=True):
         text = ensemble_ocr(image_cv, easy_reader, paddle_reader)
     
     if len(text) < MIN_TEXT_LENGTH:
-        st.error("❌ Not enough text detected. Please try a clearer image.")
         return None, image_rgb
     
     # Extract fields
     data = extract_fields_from_text(text)
     data['Timestamp'] = datetime.now().isoformat()
+    data['Source'] = source
     
     return data, image_rgb
+
+# WebRTC Video Transformer for live camera
+if WEBRTC_AVAILABLE:
+    class BusinessCardTransformer(VideoTransformerBase):
+        def __init__(self):
+            self.frame_count = 0
+            self.easy_reader = None
+            self.paddle_reader = None
+            self.auto_crop = True
+            
+        def set_readers(self, easy_reader, paddle_reader, auto_crop):
+            self.easy_reader = easy_reader
+            self.paddle_reader = paddle_reader
+            self.auto_crop = auto_crop
+            
+        def transform(self, frame):
+            img = frame.to_ndarray(format="bgr24")
+            self.frame_count += 1
+            
+            # Only process every N frames to reduce load
+            if self.frame_count % OCR_EVERY_N_FRAMES == 0 and self.easy_reader:
+                try:
+                    # Process the frame
+                    data, processed_img = process_image(
+                        img, self.easy_reader, self.paddle_reader, 
+                        self.auto_crop, "camera"
+                    )
+                    
+                    if data is not None:
+                        # Check for duplicates before adding
+                        previous_scans = load_scans()
+                        current_session_scans = st.session_state.get('live_scans', [])
+                        all_scans = previous_scans + current_session_scans
+                        
+                        if not is_duplicate(data, all_scans):
+                            with scan_lock:
+                                st.session_state.live_scans.append(data)
+                            
+                            # Auto-save if enabled
+                            if st.session_state.get('auto_save', True):
+                                save_scan(data)
+                    
+                    # Add overlay to show camera is active
+                    h, w = img.shape[:2]
+                    cv2.putText(img, "LIVE SCAN - Hold card steady", (10, 30),
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                    cv2.putText(img, f"Frame: {self.frame_count}", (10, h - 10),
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+                               
+                except Exception as e:
+                    # Don't crash on OCR errors
+                    print(f"OCR error in camera: {e}")
+            
+            return img
 
 # Main app
 def main():
     st.title("📇 Pro Business Card Scanner")
-    st.markdown("EasyOCR + PaddleOCR ensemble with auto-cropping and advanced field extraction")
+    st.markdown("Live Camera + File Upload with EasyOCR + PaddleOCR ensemble")
     
     # Initialize OCR readers
     easy_reader, paddle_reader = init_ocr()
     
+    if easy_reader is None:
+        st.error("❌ OCR failed to initialize. Please check the requirements.")
+        return
+    
     if not PADDLE_AVAILABLE:
-        st.info("ℹ️ Running with EasyOCR only. For better accuracy, install PaddleOCR locally.")
+        st.info("ℹ️ Running with EasyOCR only. For better accuracy, install PaddleOCR.")
+    
+    if not WEBRTC_AVAILABLE:
+        st.warning("⚠️ Live camera disabled. Install streamlit-webrtc for camera support.")
     
     # Sidebar
     st.sidebar.header("Settings")
     auto_crop = st.sidebar.checkbox("Auto-detect & crop card", value=True)
     auto_save = st.sidebar.checkbox("Auto-save to scans.csv", value=True)
+    st.session_state.auto_save = auto_save
     
-    # Main content
-    col1, col2 = st.columns([1, 1])
+    # Main tabs
+    tab1, tab2, tab3 = st.tabs(["📷 Live Camera", "📁 Upload Image", "📊 Scan History"])
     
-    with col1:
-        st.subheader("Upload Business Card")
+    with tab1:
+        st.subheader("Live Camera Scan")
         
-        # File uploader
-        uploaded_file = st.file_uploader(
-            "Choose an image file", 
-            type=['png', 'jpg', 'jpeg'],
-            help="Upload a clear photo of a business card"
-        )
-        
-        # Sample image for testing
-        st.markdown("---")
-        st.subheader("Test with Sample")
-        if st.button("Use Sample Business Card"):
-            # Create a sample business card image
-            sample_image = create_sample_card()
-            uploaded_file = sample_image
-    
-    with col2:
-        st.subheader("Scan Results")
-        
-        # Load previous scans
-        previous_scans = load_scans()
-        
-        if uploaded_file is not None:
-            # Read image
-            image = Image.open(uploaded_file)
+        if WEBRTC_AVAILABLE and easy_reader:
+            col1, col2 = st.columns([2, 1])
             
-            # Display original image
-            st.image(image, caption="Uploaded Image", use_column_width=True)
+            with col1:
+                st.markdown("**Instructions:**")
+                st.markdown("""
+                1. Click **START CAMERA** below
+                2. Allow camera permissions in your browser
+                3. Hold the business card steady in front of the camera
+                4. The app will automatically scan every few seconds
+                5. Detected cards will appear in the table below
+                """)
+                
+                # Camera settings
+                st.markdown("### Camera Settings")
+                scan_interval = st.slider("Scan interval (frames)", 10, 60, OCR_EVERY_N_FRAMES, 
+                                         help="Higher values = less frequent scanning")
+                
+                # Start WebRTC camera
+                rtc_config = RTCConfiguration({
+                    "iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]
+                })
+                
+                webrtc_ctx = webrtc_streamer(
+                    key="business-card-camera",
+                    mode=WebRtcMode.SENDRECV,
+                    rtc_configuration=rtc_config,
+                    video_transformer_factory=BusinessCardTransformer,
+                    media_stream_constraints={"video": True, "audio": False},
+                    async_transform=True,
+                )
+                
+                if webrtc_ctx.video_transformer:
+                    webrtc_ctx.video_transformer.set_readers(easy_reader, paddle_reader, auto_crop)
+                    webrtc_ctx.video_transformer.OCR_EVERY_N_FRAMES = scan_interval
             
-            # Process image
-            data, processed_image = process_image(
-                image, easy_reader, paddle_reader, auto_crop
+            with col2:
+                st.markdown("### Live Results")
+                st.markdown("Cards detected via camera will appear here:")
+                
+                # Show live scan results
+                if st.session_state.live_scans:
+                    live_df = pd.DataFrame(st.session_state.live_scans)
+                    display_cols = [col for col in ['Name', 'Company', 'Role', 'Phone', 'Email'] 
+                                  if col in live_df.columns]
+                    st.dataframe(live_df[display_cols].tail(5), use_container_width=True)
+                    
+                    if st.button("Clear Live Results"):
+                        st.session_state.live_scans = []
+                        st.rerun()
+                else:
+                    st.info("No live scans yet. Hold a card in front of the camera.")
+        
+        else:
+            st.error("Live camera not available. Please install streamlit-webrtc or use image upload.")
+    
+    with tab2:
+        st.subheader("Upload Business Card Image")
+        
+        col1, col2 = st.columns([1, 1])
+        
+        with col1:
+            # File uploader
+            uploaded_file = st.file_uploader(
+                "Choose an image file", 
+                type=['png', 'jpg', 'jpeg'],
+                help="Upload a clear photo of a business card"
             )
             
-            if data is not None:
-                # Display processed image if cropped
-                if auto_crop and not np.array_equal(np.array(image), processed_image):
-                    st.image(processed_image, caption="Processed Image", use_column_width=True)
-                
-                # Check for duplicates
-                if is_duplicate(data, previous_scans):
-                    st.warning("⚠️ Similar card already scanned recently.")
-                else:
-                    st.success("✅ New card detected!")
-                
-                # Display extracted data
-                st.markdown("### Extracted Information")
-                
-                col1, col2 = st.columns(2)
-                
-                with col1:
-                    if data['Name']:
-                        st.text_input("Name", data['Name'])
-                    if data['Company']:
-                        st.text_input("Company", data['Company'])
-                    if data['Role']:
-                        st.text_input("Role", data['Role'])
-                
-                with col2:
-                    if data['Phone']:
-                        st.text_input("Phone", data['Phone'])
-                    if data['TollFree']:
-                        st.text_input("Toll Free", data['TollFree'])
-                    if data['Email']:
-                        st.text_input("Email", data['Email'])
-                    if data['Website']:
-                        st.text_input("Website", data['Website'])
-                
-                # Save if not duplicate and auto-save enabled
-                if not is_duplicate(data, previous_scans) and auto_save:
-                    save_scan(data)
-                    st.success("💾 Saved to scans.csv")
-                
-                # Show raw OCR text
-                with st.expander("Show raw OCR text"):
-                    st.text_area("Raw Text", data['RawText'], height=150)
-    
-    # Display previous scans
-    st.markdown("---")
-    st.subheader("Previous Scans")
-    
-    if previous_scans:
-        scans_df = pd.DataFrame(previous_scans)
-        # Remove RawText column for display
-        display_df = scans_df.drop(columns=['RawText'], errors='ignore')
-        st.dataframe(display_df, use_container_width=True)
+            # Sample image for testing
+            st.markdown("---")
+            st.subheader("Test with Sample")
+            if st.button("Use Sample Business Card"):
+                # Create a sample business card image
+                sample_image = create_sample_card()
+                uploaded_file = sample_image
         
-        # Download button
-        csv = scans_df.to_csv(index=False)
-        st.download_button(
-            label="Download all scans as CSV",
-            data=csv,
-            file_name="business_cards.csv",
-            mime="text/csv"
-        )
-    else:
-        st.info("No scans yet. Upload a business card to get started!")
+        with col2:
+            st.subheader("Upload Results")
+            
+            # Load previous scans
+            previous_scans = load_scans()
+            
+            if uploaded_file is not None:
+                # Read image
+                image = Image.open(uploaded_file)
+                
+                # Display original image
+                st.image(image, caption="Uploaded Image", use_column_width=True)
+                
+                # Process image
+                data, processed_image = process_image(
+                    image, easy_reader, paddle_reader, auto_crop, "upload"
+                )
+                
+                if data is not None:
+                    # Display processed image if cropped
+                    if auto_crop and not np.array_equal(np.array(image), processed_image):
+                        st.image(processed_image, caption="Processed Image", use_column_width=True)
+                    
+                    # Check for duplicates
+                    if is_duplicate(data, previous_scans):
+                        st.warning("⚠️ Similar card already scanned recently.")
+                    else:
+                        st.success("✅ New card detected!")
+                    
+                    # Display extracted data
+                    st.markdown("### Extracted Information")
+                    
+                    col1, col2 = st.columns(2)
+                    
+                    with col1:
+                        if data['Name']:
+                            st.text_input("Name", data['Name'], key="name_up")
+                        if data['Company']:
+                            st.text_input("Company", data['Company'], key="company_up")
+                        if data['Role']:
+                            st.text_input("Role", data['Role'], key="role_up")
+                    
+                    with col2:
+                        if data['Phone']:
+                            st.text_input("Phone", data['Phone'], key="phone_up")
+                        if data['TollFree']:
+                            st.text_input("Toll Free", data['TollFree'], key="tollfree_up")
+                        if data['Email']:
+                            st.text_input("Email", data['Email'], key="email_up")
+                        if data['Website']:
+                            st.text_input("Website", data['Website'], key="website_up")
+                    
+                    # Save if not duplicate and auto-save enabled
+                    if not is_duplicate(data, previous_scans) and auto_save:
+                        save_scan(data)
+                        st.success("💾 Saved to scans.csv")
+                    
+                    # Show raw OCR text
+                    with st.expander("Show raw OCR text"):
+                        st.text_area("Raw Text", data['RawText'], height=150, key="raw_up")
+    
+    with tab3:
+        st.subheader("All Scanned Cards")
+        
+        # Combine live scans and saved scans
+        saved_scans = load_scans()
+        all_scans = saved_scans + st.session_state.live_scans
+        
+        if all_scans:
+            scans_df = pd.DataFrame(all_scans)
+            
+            # Remove RawText column for display
+            display_cols = [col for col in scans_df.columns if col != 'RawText']
+            display_df = scans_df[display_cols]
+            
+            st.dataframe(display_df.sort_values('Timestamp', ascending=False), 
+                        use_container_width=True,
+                        height=400)
+            
+            # Download button
+            csv = scans_df.to_csv(index=False)
+            st.download_button(
+                label="Download all scans as CSV",
+                data=csv,
+                file_name="business_cards.csv",
+                mime="text/csv"
+            )
+            
+            # Clear all data button
+            if st.button("Clear All Data"):
+                if os.path.exists(DATA_FILE):
+                    os.remove(DATA_FILE)
+                st.session_state.live_scans = []
+                st.rerun()
+        else:
+            st.info("No scans yet. Use the camera or upload an image to get started!")
 
 def create_sample_card():
     """Create a sample business card image for testing"""
