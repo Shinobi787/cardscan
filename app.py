@@ -230,14 +230,16 @@ with left:
     st.markdown("Hold the business card in front of your camera. The app will automatically scan and add entries to the table below.")
     # Start the webrtc streamer; transformer runs in background
     rtc_config = RTCConfiguration({"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]})
-    webrtc_ctx = webrtc_streamer(
-        key="business-card-webrtc",
-        mode="SENDRECV",
-        rtc_configuration=rtc_config,
-        video_transformer_factory=OCRTransformer,
-        media_stream_constraints={"video": True, "audio": False},
-        async_transform=True,
-    )
+from streamlit_webrtc import WebRtcMode
+
+webrtc_ctx = webrtc_streamer(
+    key="business-card-webrtc",
+    mode=WebRtcMode.SENDRECV,
+    rtc_configuration=rtc_config,
+    video_transformer_factory=OCRTransformer,
+    media_stream_constraints={"video": True, "audio": False},
+    async_transform=True,
+)
 
 with right:
     st.header("Controls")
@@ -285,3 +287,4 @@ if show_raw and "detected" in st.session_state and st.session_state.detected:
 st.markdown("---")
 st.caption("Works on Streamlit Cloud — requires Google Vision service account JSON in Streamlit Secrets. "
            "If you want faster scanning or better parsing, I can add auto-cropping and perspective correction next.")
+
