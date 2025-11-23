@@ -1,127 +1,139 @@
 # app.py
 """
-Streamlit Business Card Scanner
-- Use camera_input (single image) or upload
-- Preprocess image with OpenCV to improve OCR
-- Extract: Name, Company, Role, Phone, Email, Website
-- Let user edit before saving; stores to scans.csv and session
+Auto Business Card Scanner — Streamlit + Google Vision + streamlit-webrtc
+Auto-scans cards from webcam, runs Google Vision OCR automatically (every N frames),
+parses fields (Name, Company, Role, Phone, Email, Website) and appends to a live table.
+Saves entries to scans.csv if auto-save enabled.
 """
 
 import streamlit as st
-from PIL import Image
+from streamlit_webrtc import webrtc_streamer, VideoTransformerBase, RTCConfiguration
+from google.cloud import vision
+import io
+import json
+import threading
+import pandas as pd
+import re
 import numpy as np
 import cv2
-import pytesseract
-import re
-import pandas as pd
-import os
+from PIL import Image
 from datetime import datetime
-from google.cloud import vision
-import json
+import os
+import base64
 
-# ------------------ Configuration ------------------
-st.set_page_config(page_title="Business Card Scanner", layout="wide")
+# ---------------- Config ----------------
+st.set_page_config(page_title="Auto Business Card Scanner", layout="wide")
 DATA_FILE = "scans.csv"
 
-# ------------------ Regex patterns ------------------
+# How frequently to run OCR (process every N-th frame)
+OCR_EVERY_N_FRAMES = 15  # ~ once every 0.5-1s depending on camera FPS
+
+# Minimal characters in OCR full text to be considered valid
+MIN_OCR_TEXT_LEN = 20
+
+# Deduplication threshold (if same text seen recently, skip)
+DUPLICATE_SIMILARITY_THRESHOLD = 0.9
+
+# ---------------- Regex ----------------
 PHONE_REGEX = re.compile(r"(\+?\d[\d\-\s\(\)]{7,}\d)")
 EMAIL_REGEX = re.compile(r"[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+")
 WEBSITE_REGEX = re.compile(r"(https?://\S+|www\.\S+|\w+\.\w{2,})")
 
-# ------------------ Image preprocessing ------------------
-def preprocess_image(pil_img):
+# ---------------- Google Vision init ----------------
+def init_vision_client():
     """
-    Convert PIL image to OpenCV grayscale, denoise, apply CLAHE and adaptive threshold.
-    Returns processed single-channel image ready for OCR.
+    Initialize the Google Vision client from Streamlit secrets.
+    Put your service account JSON into Streamlit secrets under:
+    [google]
+    gcp_key = \"\"\"<full JSON here>\"\"\"
     """
-    img = np.array(pil_img.convert("RGB"))
-    img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
-    h, w = img.shape[:2]
-    max_w = 1200
-    if w > max_w:
-        scale = max_w / w
-        img = cv2.resize(img, (int(w * scale), int(h * scale)))
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    # Denoise
-    gray = cv2.fastNlMeansDenoising(gray, None, 10, 7, 21)
-    # Improve contrast
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-    gray = clahe.apply(gray)
-    # Adaptive threshold to remove background
-    th = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                               cv2.THRESH_BINARY, 31, 15)
-    return th
-
-def image_to_text(pil_img):
-    """Run preprocessing + Tesseract OCR and return plain text."""
     try:
-        processed = preprocess_image(pil_img)
-        # pytesseract can accept numpy array (grayscale)
-        text = pytesseract.image_to_string(processed, lang='eng')
-        return text
+        gcp_key = st.secrets["google"]["gcp_key"]
+        info = json.loads(gcp_key)
+        client = vision.ImageAnnotatorClient.from_service_account_info(info)
+        return client
     except Exception as e:
-        st.error(f"OCR error: {e}")
-        return ""
+        st.error("Google Vision client not initialized. Add your service account JSON to Streamlit secrets "
+                 "under [google] gcp_key. See README for exactly how.")
+        st.stop()
 
-# ------------------ Field extraction heuristics ------------------
-def extract_fields(text):
+client = init_vision_client()
+
+# ---------------- OCR helper ----------------
+def google_ocr_from_pil(pil_image):
     """
-    Extract Name, Company, Role, Phone, Email, Website using heuristics.
-    This is heuristic-based and will work for many cards but not all.
+    Send PIL image bytes to Google Vision and return full text (string).
+    """
+    buf = io.BytesIO()
+    pil_image.convert("RGB").save(buf, format="JPEG")
+    content = buf.getvalue()
+    image = vision.Image(content=content)
+    response = client.text_detection(image=image)
+    if response.error and response.error.message:
+        # Show error message
+        st.warning(f"Vision API error: {response.error.message}")
+        return ""
+    text = ""
+    if response.full_text_annotation and response.full_text_annotation.text:
+        text = response.full_text_annotation.text
+    return text
+
+# ---------------- Field extraction ----------------
+def extract_fields_from_text(text):
+    """
+    Heuristic extraction of Name, Company, Role, Phone, Email, Website from OCR text.
+    Returns dict with keys: Name, Company, Role, Phone, Email, Website
     """
     lines = [l.strip() for l in text.splitlines() if l.strip()]
     data = {'Name': '', 'Company': '', 'Role': '', 'Phone': '', 'Email': '', 'Website': ''}
+    if not lines:
+        return data
 
-    # Emails
+    # Email
     emails = EMAIL_REGEX.findall(text)
     if emails:
         data['Email'] = emails[0]
 
-    # Phones
+    # Phone
     phones = PHONE_REGEX.findall(text)
     if phones:
         phone = max(phones, key=len)
         phone = re.sub(r"[^+0-9]", "", phone)
         data['Phone'] = phone
 
-    # Websites
+    # Website
     webs = WEBSITE_REGEX.findall(text)
     if webs:
-        # pick reasonable-looking entry
         for w in webs:
-            if w.startswith("http") or w.startswith("www") or "." in w:
+            if w.startswith("http") or w.startswith("www") or '.' in w:
                 data['Website'] = w
                 break
 
-    # Name/Company/Role heuristics using top lines
-    if len(lines) >= 1:
-        data['Name'] = lines[0]
+    # Basic heuristics: first line likely name, second might be role/company
+    data['Name'] = lines[0]
     if len(lines) >= 2:
         second = lines[1]
-        # company keywords
         if re.search(r'\b(company|co\.|pvt|private|ltd|inc|enterprises|solutions|technologies|tech|labs)\b', second, re.IGNORECASE):
             data['Company'] = second
             if len(lines) >= 3:
                 data['Role'] = lines[2]
+        elif re.search(r'\b(manager|director|founder|ceo|coo|cto|engineer|designer|lead|head|officer|consultant|analyst|owner)\b', second, re.IGNORECASE):
+            data['Role'] = second
+            if len(lines) >= 3:
+                data['Company'] = lines[2]
         else:
-            # if second looks like a role/title
-            if re.search(r'\b(manager|director|founder|ceo|coo|cto|engineer|designer|lead|head|officer|consultant|analyst|owner)\b', second, re.IGNORECASE):
-                data['Role'] = second
-                if len(lines) >= 3:
-                    data['Company'] = lines[2]
-            else:
-                data['Company'] = second
-                if len(lines) >= 3:
-                    data['Role'] = lines[2]
+            data['Company'] = second
+            if len(lines) >= 3:
+                data['Role'] = lines[2]
 
-    # fallback: detect uppercase lines likely company
+    # fallback: uppercase likely company
     if not data['Company']:
         for l in lines[:5]:
             if l.isupper() and 2 < len(l.split()) <= 6:
                 data['Company'] = l
                 break
 
-    # cleanup: strip phone/email residuals from textual fields
+    # Clean name/company/role from stray phone/email fragments
     for k in ['Name', 'Company', 'Role']:
         if data[k]:
             data[k] = re.sub(EMAIL_REGEX, '', data[k]).strip()
@@ -129,7 +141,7 @@ def extract_fields(text):
 
     return data
 
-# ------------------ Persistence ------------------
+# ---------------- Persistence ----------------
 def load_saved():
     if os.path.exists(DATA_FILE):
         try:
@@ -144,82 +156,132 @@ def save_entry(entry):
     df = pd.concat([df, pd.DataFrame([entry])], ignore_index=True)
     df.to_csv(DATA_FILE, index=False)
 
-# ------------------ UI ------------------
-st.title("📇 Business Card Scanner (Camera or Upload)")
+# ---------------- Global results store (thread-safe) ----------------
+scan_results = []
+scan_lock = threading.Lock()
+last_text = {"value": ""}
 
-col1, col2 = st.columns([2,1])
-with col1:
-    st.header("Scan a card")
-    camera_img = st.camera_input("Capture a single business card (camera)")
-    uploaded_file = st.file_uploader("Or upload an image (png/jpg/jpeg)", type=['png','jpg','jpeg'])
+def is_duplicate_text(new_text, old_text):
+    """
+    Simple duplicate check: exact or high overlap.
+    We'll just check normalized similarity by set-of-words Jaccard.
+    """
+    if not new_text or not old_text:
+        return False
+    a = set(w.lower() for w in re.findall(r"\w+", new_text) if len(w) > 2)
+    b = set(w.lower() for w in re.findall(r"\w+", old_text) if len(w) > 2)
+    if not a or not b:
+        return False
+    inter = len(a & b)
+    union = len(a | b)
+    j = inter / union if union else 0.0
+    return j >= DUPLICATE_SIMILARITY_THRESHOLD
 
-with col2:
-    st.header("Options")
-    show_raw = st.checkbox("Show raw OCR text", value=False)
-    auto_save = st.checkbox("Auto-save to scans.csv", value=True)
-    st.markdown("---")
-    st.markdown("**Tips:** good light, steady camera, card fills frame as much as possible.")
+# ---------------- WebRTC transformer (process frames) ----------------
+class OCRTransformer(VideoTransformerBase):
+    def __init__(self):
+        self.frame_count = 0
+        self.last_ocr_text = ""
+        self.running = True
 
-# decide which image to use
-image_to_process = None
-if camera_img is not None and uploaded_file is not None:
-    st.info("Both camera capture and uploaded file present — using camera capture by default.")
-if camera_img is not None:
-    image_to_process = Image.open(camera_img)
-elif uploaded_file is not None:
-    image_to_process = Image.open(uploaded_file)
+    def transform(self, frame):
+        """
+        Called for each received video frame. We will run OCR for every Nth frame.
+        """
+        # Convert frame to numpy array (BGR)
+        img = frame.to_ndarray(format="bgr24")
+        self.frame_count += 1
 
-if image_to_process is not None:
-    st.subheader("Preview")
-    st.image(image_to_process, use_column_width=True)
-    if st.button("Run OCR and Extract"):
-        with st.spinner("Running OCR..."):
-            text = image_to_text(image_to_process)
-        if show_raw:
-            st.subheader("Raw OCR")
-            st.text_area("ocr", text, height=250)
-        fields = extract_fields(text)
-        fields['Timestamp'] = datetime.utcnow().isoformat()
+        # Only run OCR every N frames
+        if self.frame_count % OCR_EVERY_N_FRAMES == 0:
+            try:
+                # Convert to PIL for Google Vision
+                rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+                pil_im = Image.fromarray(rgb)
+                text = google_ocr_from_pil(pil_im)
 
-        st.subheader("Check & edit extracted fields")
-        name = st.text_input("Name", value=fields['Name'])
-        company = st.text_input("Company", value=fields['Company'])
-        role = st.text_input("Role", value=fields['Role'])
-        phone = st.text_input("Phone", value=fields['Phone'])
-        email = st.text_input("Email", value=fields['Email'])
-        website = st.text_input("Website", value=fields['Website'])
+                # quick length check
+                if text and len(text) >= MIN_OCR_TEXT_LEN:
+                    # Deduplicate vs last saved global text
+                    with scan_lock:
+                        prev = last_text.get("value", "")
+                        if not is_duplicate_text(text, prev):
+                            parsed = extract_fields_from_text(text)
+                            parsed['Timestamp'] = datetime.utcnow().isoformat()
+                            scan_results.append({"text": text, "parsed": parsed})
+                            last_text["value"] = text
+            except Exception as e:
+                # Don't crash transformer on OCR errors; just continue
+                print("OCR error in transformer:", str(e))
 
-        if st.button("Save to table"):
-            entry = {
-                'Name': name.strip(),
-                'Company': company.strip(),
-                'Role': role.strip(),
-                'Phone': phone.strip(),
-                'Email': email.strip(),
-                'Website': website.strip(),
-                'Timestamp': fields['Timestamp']
-            }
-            if 'cards' not in st.session_state:
-                st.session_state.cards = []
-            st.session_state.cards.append(entry)
-            if auto_save:
-                save_entry(entry)
-            st.success("Saved entry.")
+        # (Optionally) overlay some indicator on frame
+        overlay = img.copy()
+        h, w = overlay.shape[:2]
+        cv2.putText(overlay, "Auto-scan ON", (10, h - 10),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+        return overlay
 
+# ---------------- Streamlit UI ----------------
+st.title("📇 Auto Business Card Scanner — Google Vision OCR (Auto-scan mode)")
+
+left, right = st.columns([2, 1])
+with left:
+    st.header("Live Camera (Auto-scan)")
+    st.markdown("Hold the business card in front of your camera. The app will automatically scan and add entries to the table below.")
+    # Start the webrtc streamer; transformer runs in background
+    rtc_config = RTCConfiguration({"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]})
+    webrtc_ctx = webrtc_streamer(
+        key="business-card-webrtc",
+        mode="SENDRECV",
+        rtc_configuration=rtc_config,
+        video_transformer_factory=OCRTransformer,
+        media_stream_constraints={"video": True, "audio": False},
+        async_transform=True,
+    )
+
+with right:
+    st.header("Controls")
+    st.write(f"- OCR every **{OCR_EVERY_N_FRAMES}** frames")
+    st.write(f"- Duplicate similarity threshold: **{DUPLICATE_SIMILARITY_THRESHOLD}**")
+    auto_save = st.checkbox("Auto-save detected entries to scans.csv", value=True)
+    show_raw = st.checkbox("Show raw OCR (latest)", value=False)
+    clear_button = st.button("Clear saved session entries (not file)")
+
+# Show live parsed results (read from scan_results)
 st.markdown("---")
-st.subheader("Scanned Cards")
+st.subheader("Detected entries (live)")
+with scan_lock:
+    # Move new parsed entries from global store into session_state so Streamlit displays them
+    if "detected" not in st.session_state:
+        st.session_state.detected = []
+    # Move all scan_results parsed into session list
+    while scan_results:
+        item = scan_results.pop(0)
+        parsed = item["parsed"]
+        st.session_state.detected.insert(0, parsed)  # newest first
+        if auto_save:
+            save_entry(parsed)
 
-saved_df = load_saved()
-session_df = pd.DataFrame(st.session_state.get('cards', [])) if 'cards' in st.session_state else pd.DataFrame()
-display_df = pd.concat([session_df, saved_df], ignore_index=True) if not session_df.empty else saved_df
+# If clear pressed, clear session_state.detected
+if clear_button:
+    st.session_state.detected = []
+    st.success("Cleared current session detections (scans.csv file not deleted).")
 
-if display_df.empty:
-    st.info("No scanned cards yet.")
+# Display table
+detected_df = pd.DataFrame(st.session_state.get("detected", []))
+if not detected_df.empty:
+    # Show latest first
+    st.dataframe(detected_df[['Name','Company','Role','Phone','Email','Website','Timestamp']].fillna(''), use_container_width=True)
+    csv = detected_df.to_csv(index=False).encode('utf-8')
+    st.download_button("Download CSV of current session", csv, file_name="scans_session.csv", mime="text/csv")
 else:
-    st.dataframe(display_df[['Name','Company','Role','Phone','Email','Website','Timestamp']].fillna(''))
-    csv = display_df.to_csv(index=False).encode('utf-8')
-    st.download_button("Download CSV", csv, file_name="scans.csv", mime="text/csv")
+    st.info("No cards detected yet. Hold a card in front of the camera. Scans will appear automatically.")
+
+# Show (optional) latest raw OCR text
+if show_raw and "detected" in st.session_state and st.session_state.detected:
+    st.markdown("### Latest parsed OCR text (raw)")
+    st.text_area("raw_ocr", value=last_text.get("value", ""), height=180)
 
 st.markdown("---")
-st.caption("App uses OpenCV + Tesseract OCR. For best accuracy, consider training OCR models or using a commercial OCR API.")
-
+st.caption("Works on Streamlit Cloud — requires Google Vision service account JSON in Streamlit Secrets. "
+           "If you want faster scanning or better parsing, I can add auto-cropping and perspective correction next.")
