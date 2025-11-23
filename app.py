@@ -10,23 +10,55 @@ st.set_page_config(page_title="Business Card Scanner", layout="wide")
 
 API_KEY = "helloworld"   # Free OCR.Space demo key
 
-# ---------------- OCR API ----------------
+# ---------------- SAFE OCR API ----------------
 def ocr_space(image_bytes):
     url = "https://api.ocr.space/parse/image"
-    r = requests.post(
-        url,
-        files={"file": ("card.png", image_bytes)},
-        data={"apikey": API_KEY}
-    )
-    res = r.json()
-    if res.get("ParsedResults"):
-        return res["ParsedResults"][0]["ParsedText"]
-    return ""
+
+    # 1. Send API request safely
+    try:
+        r = requests.post(
+            url,
+            files={"file": ("card.png", image_bytes)},
+            data={"apikey": API_KEY},
+            timeout=40
+        )
+    except Exception as e:
+        return f"OCR Request Failed: {e}"
+
+    # 2. Try JSON parsing safely
+    try:
+        res = r.json()
+    except Exception:
+        return "OCR Error: Invalid response from OCR API"
+
+    # 3. Ensure response is a dict
+    if not isinstance(res, dict):
+        return "OCR Error: Malformed API response"
+
+    # 4. Check known OCR errors
+    if "ErrorMessage" in res:
+        try:
+            return f"OCR API Error: {res['ErrorMessage'][0]}"
+        except:
+            return f"OCR API Error: {res['ErrorMessage']}"
+
+    # 5. Check for result field
+    if "ParsedResults" not in res:
+        return "OCR Error: No parsed results from OCR API"
+
+    # 6. Return parsed text safely
+    try:
+        return res["ParsedResults"][0].get("ParsedText", "")
+    except:
+        return "OCR Error: Parsed text missing"
+
 
 # ---------------- REGEX ----------------
 PHONE_REGEX = re.compile(r"(\+?\d[\d\-\s\(\)]{6,}\d)")
 EMAIL_REGEX = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
-WEBSITE_REGEX = re.compile(r"(https?://\S+|www\.\S+|\b[A-Za-z0-9-]+\.(com|in|net|io|co|org|biz)\b)")
+WEBSITE_REGEX = re.compile(
+    r"(https?://\S+|www\.\S+|\b[A-Za-z0-9-]+\.(com|in|net|io|co|org|biz)\b)"
+)
 
 ROLE_KEYWORDS = [
     "ceo","cto","coo","cfo","founder","director","owner","manager",
@@ -38,36 +70,35 @@ COMP_SUFFIX = [
     "technologies","solutions","studio","labs","group","enterprise"
 ]
 
-# ---------------- EXTRACTION V2 ----------------
+# ---------------- HELPERS ----------------
 def clean_text(s):
-    return re.sub(r'\s+', ' ', s).strip()
+    return re.sub(r"\s+", " ", s).strip()
 
 def fix_email(e):
     e = e.replace(" ", "").replace("(at)", "@").replace("[at]", "@")
-    e = e.replace("@.", "@")
-    if ".in" in e or ".com" in e:
-        return e
-    return e
+    return e.replace("@.", "@")
 
 def fix_website(w):
     w = w.strip().replace(" ", "")
     if not w:
         return ""
     if not w.startswith("http"):
-        w = "https://" + w
+        return "https://" + w
     return w
 
+# ---------------- EXTRACTION ENGINE V2 ----------------
 def extract_v2(text):
     lines = [clean_text(l) for l in text.split("\n") if clean_text(l)]
     block = "\n".join(lines)
 
-    # ----- PHONE -----
-    all_phones = PHONE_REGEX.findall(block)
-    all_phones = [re.sub(r'[^0-9+]', '', p) for p in all_phones]
+    # PHONE
+    raw = PHONE_REGEX.findall(block)
+    raw = [re.sub(r"[^0-9+]", "", p) for p in raw]
     primary = secondary = toll = ""
 
-    for p in all_phones:
+    for p in raw:
         digits = re.sub(r"\D", "", p)
+
         if digits.startswith("1800"):
             toll = p
         elif len(digits) == 10 or (len(digits) == 12 and digits.startswith("91")):
@@ -76,38 +107,40 @@ def extract_v2(text):
             else:
                 secondary = p
 
-    # ----- EMAIL -----
+    # EMAIL
     emails = EMAIL_REGEX.findall(block)
     email = fix_email(emails[0]) if emails else ""
 
-    # ----- WEBSITE -----
+    # WEBSITE
     webs = WEBSITE_REGEX.findall(block)
-    website = fix_website(webs[0][0] if isinstance(webs[0], tuple) else webs[0]) if webs else ""
+    website = fix_website(
+        webs[0][0] if isinstance(webs[0], tuple) else webs[0]
+    ) if webs else ""
 
-    # ----- ROLE -----
+    # ROLE
     role = ""
     for l in lines:
         if any(k in l.lower() for k in ROLE_KEYWORDS):
             role = l.title()
             break
 
-    # ----- COMPANY -----
+    # COMPANY
     company = ""
     for l in lines:
         if any(s in l.lower() for s in COMP_SUFFIX):
             company = l.title()
             break
 
-    # ----- NAME -----
+    # NAME
     name = ""
     for l in lines:
         if (
             2 <= len(l.split()) <= 4 and
             not any(k in l.lower() for k in ROLE_KEYWORDS) and
             not any(s in l.lower() for s in COMP_SUFFIX) and
-            not "@" in l and
-            not ".com" in l.lower() and
-            not ".in" in l.lower() and
+            "@" not in l and
+            ".com" not in l.lower() and
+            ".in" not in l.lower() and
             not any(ch.isdigit() for ch in l)
         ):
             name = l.title()
@@ -129,6 +162,7 @@ def extract_v2(text):
         "Timestamp": datetime.utcnow().isoformat()
     }
 
+
 # ---------------- STORAGE ----------------
 def load_csv():
     try:
@@ -139,37 +173,39 @@ def load_csv():
             "TollFree","Email","Website","RawText","Timestamp"
         ])
 
-def save_row(d):
+def save_row(row):
     df = load_csv()
-    df.loc[len(df)] = d
+    df.loc[len(df)] = row
     df.to_csv("scans.csv", index=False)
 
+
 # ---------------- UI ----------------
-st.title("📇 Business Card Scanner — OCR.Space + Extraction V2")
+st.title("📇 Business Card Scanner — 100% Crash-Safe OCR (OCR.Space)")
 
-col1, col2 = st.columns([2,1])
+left, right = st.columns([2,1])
 
-with col1:
+with left:
     cam = st.camera_input("Take a Photo")
-    upload = st.file_uploader("Upload Image", type=["png","jpg","jpeg"])
+    upload = st.file_uploader("Upload Image", type=["jpg","jpeg","png"])
 
-with col2:
+with right:
     auto = st.checkbox("Auto-Save", value=True)
-    clear = st.button("Clear All")
+    clear = st.button("Clear All Data")
 
 if "cards" not in st.session_state:
     st.session_state.cards = []
 
 image_bytes = None
+
 if cam:
     image_bytes = cam.getvalue()
 elif upload:
     image_bytes = upload.read()
 
 if image_bytes:
-    st.image(image_bytes, caption="Input", use_column_width=True)
+    st.image(image_bytes, caption="Scanned Image", use_column_width=True)
 
-    with st.spinner("Extracting text..."):
+    with st.spinner("Reading text…"):
         text = ocr_space(image_bytes)
 
     st.text_area("OCR Output", text, height=200)
@@ -187,11 +223,11 @@ if clear:
     st.session_state.cards = []
     df = load_csv()
     df.to_csv("scans.csv", index=False)
-    st.success("All cleared!")
+    st.success("All data cleared!")
 
 df = load_csv()
-st.subheader("📄 Saved Data")
+st.subheader("📄 Saved Records")
 st.dataframe(df, use_container_width=True)
 
-csv = df.to_csv(index=False).encode("utf-8")
+csv = df.to_csv(index=False).encode()
 st.download_button("Download CSV", csv, "cards.csv", "text/csv")
