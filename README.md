@@ -1,42 +1,30 @@
-# Auto Business Card Scanner (Streamlit + Google Vision + WebRTC)
+# Auto Business Card Scanner (EasyOCR)
 
-This app auto-scans business cards using the webcam and Google Vision OCR, then parses fields and stores entries.
-
-## Setup (Google Cloud & secrets)
-
-1. Create a Google Cloud Project.
-2. Enable the Vision API for that project.
-3. Create a Service Account (IAM) and add a JSON key.
-4. In Streamlit Cloud, open your app → Settings → Secrets, and paste:
-
-[google]
-gcp_key = """
-{ ... paste entire service account JSON file content here ... }
-"""
-
-(Use the triple-quotes exactly as above. Do NOT commit the JSON to GitHub.)
+This Streamlit app scans business cards using EasyOCR (no Google Cloud, no billing) and saves results into scans.csv.
 
 ## Files
 - app.py
 - requirements.txt
 
-## Run locally (optional)
-1. Create virtualenv and install requirements:
+## How to run locally
+1. Create virtualenv:
    python -m venv venv
    source venv/bin/activate   # macOS/Linux
-   venv\\Scripts\\activate    # Windows
+   venv\Scripts\activate      # Windows
+
+2. Install:
    pip install -r requirements.txt
 
-2. Run:
+3. Run:
    streamlit run app.py
 
 ## Deploy to Streamlit Cloud
-1. Push to GitHub.
-2. Create a new app on Streamlit Cloud and link to the repo.
-3. Add the secret (see above).
-4. Start the app — the camera will ask for permission; hold the card in front of camera.
+1. Push repository to GitHub.
+2. Create a new app on Streamlit Cloud and link the repo + branch.
+3. Use the default start command (streamlit run app.py).
+4. Allow camera permission in your browser. Click "Take photo" to capture the card (mobile browsers also work).
+5. Scans are appended automatically if they are unique.
 
 ## Notes
-- The app runs OCR every N frames (configurable in app). Adjust OCR_EVERY_N_FRAMES in `app.py`.
-- The app stores detections in `scans.csv` if Auto-save is checked.
-- If you want image auto-cropping (detect card box & perspective correction) or integration with Google Sheets / Airtable, I can add that next.
+- This app uses snapshot captures (browser 'Take photo'). True continuous streaming requires WebRTC and reliable TURN servers which are not recommended for Streamlit Cloud.
+- If you want OCR quality improvements, I can add: perspective auto-crop, image enhancement, or a simple UI for selecting best OCR result per card.
