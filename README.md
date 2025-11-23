@@ -1,41 +1,42 @@
-# Business Card Scanner (Streamlit)
+# Auto Business Card Scanner (Streamlit + Google Vision + WebRTC)
 
-## What this does
-Captures a single business card image (camera or upload), pre-processes it, runs Tesseract OCR and extracts Name, Company, Role, Phone, Email, Website. Results can be edited and saved to scans.csv. You can download a CSV of all saved scans.
+This app auto-scans business cards using the webcam and Google Vision OCR, then parses fields and stores entries.
 
-## Important: install Tesseract OCR (system-level)
-pytesseract is a Python wrapper. You must install the Tesseract engine:
+## Setup (Google Cloud & secrets)
 
-- Ubuntu/Debian:
-  sudo apt-get update
-  sudo apt-get install -y tesseract-ocr
+1. Create a Google Cloud Project.
+2. Enable the Vision API for that project.
+3. Create a Service Account (IAM) and add a JSON key.
+4. In Streamlit Cloud, open your app → Settings → Secrets, and paste:
 
-- macOS (Homebrew):
-  brew install tesseract
+[google]
+gcp_key = """
+{ ... paste entire service account JSON file content here ... }
+"""
 
-- Windows:
-  Download and install from the tesseract project (or use Chocolatey).
+(Use the triple-quotes exactly as above. Do NOT commit the JSON to GitHub.)
 
-## Run locally
-1. Create and activate virtualenv:
+## Files
+- app.py
+- requirements.txt
+
+## Run locally (optional)
+1. Create virtualenv and install requirements:
    python -m venv venv
    source venv/bin/activate   # macOS/Linux
-   venv\Scripts\activate      # Windows
-
-2. Install Python deps:
+   venv\\Scripts\\activate    # Windows
    pip install -r requirements.txt
 
-3. Run:
+2. Run:
    streamlit run app.py
 
 ## Deploy to Streamlit Cloud
-1. Push repo to GitHub.
-2. Create new app on Streamlit Cloud referencing the repo.
-3. **Caveat**: Streamlit Cloud may NOT include system packages like Tesseract. If it's missing, options:
-   - Deploy using a Docker image where you install tesseract-ocr.
-   - Deploy to a server (VPS) where you can apt-get install tesseract.
-   - Replace OCR with a cloud OCR API (Google Vision, Azure, AWS) and call the API in `image_to_text()`; this avoids the need for local Tesseract.
+1. Push to GitHub.
+2. Create a new app on Streamlit Cloud and link to the repo.
+3. Add the secret (see above).
+4. Start the app — the camera will ask for permission; hold the card in front of camera.
 
-## Notes & improvements
-- Heuristics are simple — for best results use a layout-aware OCR or ML model.
-- You can integrate with Google Sheets / Airtable / database for live sync.
+## Notes
+- The app runs OCR every N frames (configurable in app). Adjust OCR_EVERY_N_FRAMES in `app.py`.
+- The app stores detections in `scans.csv` if Auto-save is checked.
+- If you want image auto-cropping (detect card box & perspective correction) or integration with Google Sheets / Airtable, I can add that next.
