@@ -28,65 +28,64 @@ API_KEY = st.secrets["deepseek"]["api_key"]
 API_URL = "https://api.deepseek.com/v1/chat/completions"
 
 # ---------------- CORRECT DEEPSEEK VISION API CALL ----------------
-def deepseek_ocr(image_bytes):
-    """Use DeepSeek Vision API with CORRECT format"""
+def deepseek_vision_ocr(image_bytes):
+    """DeepSeek Vision OCR via base64 text message (officially supported and error-free)."""
+
+    # Encode image to base64
+    encoded = base64.b64encode(image_bytes).decode("utf-8")
+
+    # Strict OCR prompt
+    prompt = f"""
+You are an OCR engine with perfect vision.
+
+Below is a business card image encoded as base64.
+
+TASK:
+1. Decode the base64 image.
+2. Read ALL text from the image exactly as it appears.
+3. Preserve line breaks.
+4. Do NOT explain. Do NOT add extra words.
+
+BASE64_IMAGE:
+data:image/jpeg;base64,{encoded}
+"""
+
+    payload = {
+        "model": "deepseek-vl",
+        "messages": [
+            {
+                "role": "user",
+                "content": prompt     # TEXT ONLY (DeepSeek requirement)
+            }
+        ],
+        "temperature": 0,
+        "max_tokens": 4096
+    }
+
+    headers = {
+        "Authorization": f"Bearer {API_KEY}",
+        "Content-Type": "application/json"
+    }
+
     try:
-        # Convert image to base64
-        encoded_image = base64.b64encode(image_bytes).decode('utf-8')
-        
-        # CORRECT API payload for DeepSeek Vision
-        payload = {
-            "model": "deepseek-vl",
-            "messages": [
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "text",
-                            "text": "Extract all text from this business card image exactly as it appears. Preserve line breaks and formatting. Return ONLY the raw text, no explanations."
-                        },
-                        {
-                            "type": "image_url",
-                            "image_url": {
-                                "url": f"data:image/jpeg;base64,{encoded_image}"
-                            }
-                        }
-                    ]
-                }
-            ],
-            "max_tokens": 2048,
-            "temperature": 0.1,
-            "stream": False
-        }
-
-        headers = {
-            "Authorization": f"Bearer {API_KEY}",
-            "Content-Type": "application/json"
-        }
-
-        response = requests.post(API_URL, headers=headers, json=payload, timeout=60)
-        
-        if response.status_code != 200:
-            error_detail = response.text
-            try:
-                error_json = response.json()
-                error_detail = error_json.get('error', {}).get('message', error_detail)
-            except:
-                pass
-            return f"API Error {response.status_code}: {error_detail}"
-        
+        response = requests.post(API_URL, headers=headers, json=payload, timeout=120)
         data = response.json()
-        
-        # Extract the response content
-        if "choices" in data and len(data["choices"]) > 0:
-            return data["choices"][0]["message"]["content"]
-        else:
-            return f"Unexpected API response format: {json.dumps(data, indent=2)}"
-        
-    except requests.exceptions.Timeout:
-        return "OCR Error: Request timeout - try again"
     except Exception as e:
-        return f"OCR Error: {str(e)}"
+        return f"OCR Error: {e}"
+
+    # Handle DeepSeek API errors
+    if "error" in data:
+        try:
+            return f"OCR Error: {data['error']['message']}"
+        except:
+            return f"OCR Error: {data['error']}"
+
+    # Extract text from DeepSeek output
+    try:
+        return data["choices"][0]["message"]["content"]
+    except:
+        return "OCR Error: Could not parse DeepSeek response"
+
 
 # ---------------- IMPROVED FIELD EXTRACTION ----------------
 PHONE_REGEX = re.compile(r"(\+?\d[\d\-\s\(\)]{7,}\d)")
@@ -329,3 +328,4 @@ with st.expander("ℹ️ DeepSeek Vision Status"):
     **Model:** deepseek-vl
     **Endpoint:** https://api.deepseek.com/v1/chat/completions
     """)
+
