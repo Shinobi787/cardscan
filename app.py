@@ -29,7 +29,7 @@ API_URL = "https://api.deepseek.com/v1/chat/completions"
 
 # ---------------- CORRECT DEEPSEEK VISION API CALL ----------------
 def deepseek_ocr(image_bytes):
-    """DeepSeek Vision OCR via base64 text message (officially supported and error-free)."""
+    """DeepSeek Vision OCR via base64 text message using deepseek-chat model."""
 
     # Encode image to base64
     encoded = base64.b64encode(image_bytes).decode("utf-8")
@@ -45,21 +45,22 @@ TASK:
 2. Read ALL text from the image exactly as it appears.
 3. Preserve line breaks.
 4. Do NOT explain. Do NOT add extra words.
+5. Return ONLY the raw text content.
 
 BASE64_IMAGE:
 data:image/jpeg;base64,{encoded}
 """
 
     payload = {
-        "model": "deepseek-vl",
+        "model": "deepseek-chat",  # Using available model
         "messages": [
             {
                 "role": "user",
-                "content": prompt     # TEXT ONLY (DeepSeek requirement)
+                "content": prompt
             }
         ],
         "temperature": 0,
-        "max_tokens": 4096
+        "max_tokens": 2048
     }
 
     headers = {
@@ -192,8 +193,8 @@ def save_scan(data):
         return False
 
 # ---------------- STREAMLIT UI ----------------
-st.title("📇 Business Card Scanner — DeepSeek Vision")
-st.markdown("**Powered by DeepSeek Vision AI**")
+st.title("📇 Business Card Scanner — DeepSeek")
+st.markdown("**Powered by DeepSeek AI**")
 
 col1, col2 = st.columns([2, 1])
 
@@ -228,14 +229,14 @@ with col2:
             st.error(f"Clear error: {e}")
 
 # Process image when available
-if image_bytes and st.button("🔍 Scan with DeepSeek Vision", type="primary"):
-    with st.spinner("🔄 Calling DeepSeek Vision API..."):
+if image_bytes and st.button("🔍 Scan with DeepSeek", type="primary"):
+    with st.spinner("🔄 Calling DeepSeek API..."):
         raw_text = deepseek_ocr(image_bytes)
         
         st.subheader("📄 OCR Results")
         
         if raw_text and not any(error in raw_text for error in ["OCR Error", "API Error"]):
-            st.success("✅ DeepSeek Vision OCR Successful!")
+            st.success("✅ DeepSeek OCR Successful!")
             
             # Show raw text
             with st.expander("📋 Raw Extracted Text"):
@@ -315,15 +316,15 @@ else:
     st.info("No scans yet. Capture a business card to get started!")
 
 # API status
-with st.expander("ℹ️ DeepSeek Vision Status"):
+with st.expander("ℹ️ DeepSeek Status"):
     st.markdown("""
-    **DeepSeek Vision Features:**
-    - High accuracy OCR for business cards
+    **DeepSeek Features:**
+    - OCR via base64 image embedding
     - Handles various fonts and layouts
-    - Extracts text from complex backgrounds
+    - Extracts text from business cards
     - Supports multiple languages
     
     **Current Status:** ✅ Configured
-    **Model:** deepseek-vl
+    **Model:** deepseek-chat
     **Endpoint:** https://api.deepseek.com/v1/chat/completions
     """)
