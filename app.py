@@ -1,330 +1,285 @@
+# app.py
 import streamlit as st
-import requests
+from PIL import Image
+import io
+import re
 import base64
 import pandas as pd
-import re
-import json
-import io
+import numpy as np
+import requests
 from datetime import datetime
 
-st.set_page_config(page_title="Business Card Scanner — DeepSeek Vision", layout="wide")
+st.set_page_config(page_title="Business Card Scanner — RapidOCR", layout="wide")
 
-# ---------------- DEEPSEEK API CONFIG ----------------
-if "deepseek" not in st.secrets or "api_key" not in st.secrets["deepseek"]:
-    st.error("🔑 DeepSeek API Key not found in secrets!")
-    st.info("""
-    **To set up your API key:**
-    1. Get a DeepSeek API key from https://platform.deepseek.com/
-    2. In Streamlit Cloud, go to Settings → Secrets
-    3. Add this:
-    ```
-    [deepseek]
-    api_key = "your_actual_api_key_here"
-    ```
-    """)
-    st.stop()
+# ---------------- Settings ----------------
+# Fallback OCR.space demo key (used only if rapidocr is not available)
+OCR_SPACE_KEY = "helloworld"
 
-API_KEY = st.secrets["deepseek"]["api_key"]
-API_URL = "https://api.deepseek.com/v1/chat/completions"
+# A sample uploaded file path that you provided earlier (used only for debug/demo).
+# The platform will convert local path to a URL when needed (developer note).
+SAMPLE_LOCAL_PATH = "/mnt/data/52f7bca3-4259-45d0-8ca1-ff467481fb56.png"
 
-# ---------------- CORRECT DEEPSEEK VISION API CALL ----------------
-def deepseek_ocr(image_bytes):
-    """DeepSeek Vision OCR via base64 text message using deepseek-chat model."""
-
-    # Encode image to base64
-    encoded = base64.b64encode(image_bytes).decode("utf-8")
-
-    # Strict OCR prompt
-    prompt = f"""
-You are an OCR engine with perfect vision.
-
-Below is a business card image encoded as base64.
-
-TASK:
-1. Decode the base64 image.
-2. Read ALL text from the image exactly as it appears.
-3. Preserve line breaks.
-4. Do NOT explain. Do NOT add extra words.
-5. Return ONLY the raw text content.
-
-BASE64_IMAGE:
-data:image/jpeg;base64,{encoded}
-"""
-
-    payload = {
-        "model": "deepseek-chat",  # Using available model
-        "messages": [
-            {
-                "role": "user",
-                "content": prompt
-            }
-        ],
-        "temperature": 0,
-        "max_tokens": 2048
-    }
-
-    headers = {
-        "Authorization": f"Bearer {API_KEY}",
-        "Content-Type": "application/json"
-    }
-
+# ---------------- Try to load RapidOCR ----------------
+USE_RAPIDOCR = False
+reader = None
+try:
+    # rapidocr has a simple API: from rapidocr import RapidOCR or rapidocr import Reader
+    # Different versions differ; we'll attempt the common import patterns:
     try:
-        response = requests.post(API_URL, headers=headers, json=payload, timeout=120)
-        data = response.json()
-    except Exception as e:
-        return f"OCR Error: {e}"
+        # new-style
+        from rapidocr import RapidOCR
+        reader = RapidOCR()
+        USE_RAPIDOCR = True
+    except Exception:
+        from rapidocr import Reader  # fallback
+        reader = Reader()
+        USE_RAPIDOCR = True
+except Exception:
+    USE_RAPIDOCR = False
 
-    # Handle DeepSeek API errors
-    if "error" in data:
+# ---------------- OCR helpers ----------------
+def rapidocr_extract(image_bytes):
+    """
+    Use rapidocr reader to get text. Returns plain text.
+    """
+    try:
+        # reader might accept PIL image or bytes depending on version
+        # try both
+        pil = Image.open(io.BytesIO(image_bytes)).convert("RGB")
         try:
-            return f"OCR Error: {data['error']['message']}"
-        except:
-            return f"OCR Error: {data['error']}"
+            # some RapidOCR versions: reader.readtext(pil) -> list of (box, text, score)
+            res = reader.readtext(pil)
+        except Exception:
+            # other variants return strings
+            res = reader.recognize(pil)
+        # Normalize result into text
+        if isinstance(res, str):
+            return res
+        texts = []
+        for item in res:
+            # res may be list of tuples or dicts
+            if isinstance(item, (list, tuple)) and len(item) >= 2:
+                # many versions: (bbox, text, score)
+                texts.append(item[1])
+            elif isinstance(item, dict) and "text" in item:
+                texts.append(item["text"])
+            else:
+                # fallback: stringify
+                texts.append(str(item))
+        return "\n".join([t.strip() for t in texts if t and t.strip()])
+    except Exception as e:
+        return f"OCR Error (rapidocr): {e}"
 
-    # Extract text from DeepSeek output
+def ocr_space_api(image_bytes):
+    """
+    Fallback OCR using OCR.Space public demo key.
+    """
+    url = "https://api.ocr.space/parse/image"
     try:
-        return data["choices"][0]["message"]["content"]
-    except:
-        return "OCR Error: Could not parse DeepSeek response"
+        r = requests.post(
+            url,
+            files={"file": ("card.png", image_bytes)},
+            data={"apikey": OCR_SPACE_KEY},
+            timeout=60
+        )
+    except Exception as e:
+        return f"OCR Error (ocr.space): {e}"
 
-# ---------------- IMPROVED FIELD EXTRACTION ----------------
-PHONE_REGEX = re.compile(r"(\+?\d[\d\-\s\(\)]{7,}\d)")
+    try:
+        j = r.json()
+    except Exception:
+        return "OCR Error (ocr.space): Invalid JSON response"
+
+    if "ParsedResults" in j and j["ParsedResults"]:
+        return j["ParsedResults"][0].get("ParsedText", "")
+    # return error message if present
+    if "ErrorMessage" in j and j["ErrorMessage"]:
+        return f"OCR Error (ocr.space): {j['ErrorMessage']}"
+    return "OCR Error (ocr.space): No parsed results"
+
+def ocr_dispatch(image_bytes):
+    """
+    Choose rapidocr if available, otherwise fallback.
+    """
+    if USE_RAPIDOCR:
+        txt = rapidocr_extract(image_bytes)
+        # If rapidocr fails with an OCR Error string, fallback
+        if isinstance(txt, str) and txt.startswith("OCR Error"):
+            return ocr_space_api(image_bytes)
+        return txt
+    else:
+        return ocr_space_api(image_bytes)
+
+# ---------------- Extraction rules (V2 improved) ----------------
+PHONE_REGEX = re.compile(r"(\+?\d[\d\-\s\(\)]{6,}\d)")
 EMAIL_REGEX = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
-WEBSITE_REGEX = re.compile(r"(https?://[^\s]+|www\.[^\s]+|[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})")
+WEBSITE_REGEX = re.compile(r"(https?://\S+|www\.\S+|\b[A-Za-z0-9-]+\.(com|in|net|io|co|org|biz)\b)")
 
-def extract_fields_advanced(text):
-    """Advanced field extraction with better heuristics"""
-    if any(error in text for error in ["OCR Error", "API Error"]):
+ROLE_KEYWORDS = [
+    "ceo","cto","coo","cfo","founder","director","owner","manager",
+    "lead","engineer","marketing","sales","product","executive","md","gm"
+]
+
+COMP_SUFFIX = [
+    "pvt","private","limited","ltd","llp","inc","co","company","tech",
+    "technologies","solutions","studio","labs","group","enterprise"
+]
+
+def clean_text(s):
+    return re.sub(r'\s+', ' ', s).strip()
+
+def extract_fields(text):
+    if not text or text.startswith("OCR Error"):
         return {
-            "Name": "", "Company": "", "Role": "",
-            "Phone": "", "Email": "", "Website": "",
+            "Name": "",
+            "Company": "",
+            "Role": "",
+            "Phone": "",
+            "SecondPhone": "",
+            "Email": "",
+            "Website": "",
             "RawText": text,
-            "Timestamp": datetime.now().isoformat()
+            "Timestamp": datetime.utcnow().isoformat()
         }
 
-    lines = [line.strip() for line in text.split("\n") if line.strip()]
-    
-    data = {
-        "Name": "",
-        "Company": "",
-        "Role": "",
-        "Phone": "",
-        "Email": "",
-        "Website": "",
-        "RawText": text,
-        "Timestamp": datetime.now().isoformat()
-    }
-    
-    # Extract contact info
-    phones = PHONE_REGEX.findall(text)
-    if phones:
-        data["Phone"] = re.sub(r'[^\d+]', '', phones[0])
-    
-    emails = EMAIL_REGEX.findall(text)
-    if emails:
-        data["Email"] = emails[0]
-    
-    websites = WEBSITE_REGEX.findall(text)
-    if websites:
-        for web in websites[:3]:  # Check first 3 matches
-            clean_web = web if isinstance(web, str) else web[0]
-            if len(clean_web) > 5 and '.' in clean_web and '@' not in clean_web:
-                data["Website"] = clean_web
-                break
-    
-    # Advanced name/company/role extraction
-    if lines:
-        # Name is usually first non-empty line
-        data["Name"] = lines[0]
-        
-        # Analyze remaining lines
-        remaining_lines = lines[1:]
-        
-        for i, line in enumerate(remaining_lines):
-            line_lower = line.lower()
-            
-            # Role detection
-            role_patterns = [
-                r'\b(manager|director|president|ceo|cto|cfo|vp|vice president|engineer|analyst|specialist|consultant|officer|head|lead|developer|designer|architect)\b',
-                r'\b(senior|junior|principal|staff)\s+\w+',
-                r'\b(head|chief|lead)\s+of\s+\w+'
-            ]
-            
-            for pattern in role_patterns:
-                if re.search(pattern, line_lower, re.IGNORECASE):
-                    data["Role"] = line
-                    break
-            
-            # Company detection
-            company_indicators = ['inc', 'corp', 'llc', 'ltd', 'company', 'co.', 'group', 'technologies', 'solutions', 'systems', 'enterprises']
-            if any(indicator in line_lower for indicator in company_indicators):
-                data["Company"] = line
-            elif not data["Company"] and (line.isupper() or any(word.istitle() for word in line.split())):
-                # Company names often have proper capitalization or are all caps
-                if len(line.split()) <= 4:  # Reasonable company name length
-                    data["Company"] = line
-            
-            # Stop after checking a few lines
-            if i >= 4:
-                break
-    
-    return data
+    lines = [clean_text(l) for l in text.split("\n") if clean_text(l)]
+    block = "\n".join(lines)
 
-# ---------------- DATA MANAGEMENT ----------------
-def load_scans():
-    """Load existing scans from CSV"""
+    # phones
+    all_phones = PHONE_REGEX.findall(block)
+    all_phones = [re.sub(r'[^0-9+]', '', p) for p in all_phones]
+    primary = ""
+    secondary = ""
+    toll = ""
+    for p in all_phones:
+        digits = re.sub(r"\D","", p)
+        if digits.startswith("1800"):
+            toll = p
+        elif len(digits) >= 10:
+            if not primary:
+                primary = p
+            elif not secondary:
+                secondary = p
+
+    # email
+    emails = EMAIL_REGEX.findall(block)
+    email = emails[0] if emails else ""
+
+    # website
+    webs = WEBSITE_REGEX.findall(block)
+    website = ""
+    if webs:
+        first = webs[0]
+        if isinstance(first, tuple):
+            website = first[0]
+        else:
+            website = first
+
+    # role
+    role = ""
+    for l in lines:
+        if any(k in l.lower() for k in ROLE_KEYWORDS):
+            role = l.title()
+            break
+
+    # company
+    company = ""
+    for l in lines:
+        if any(s in l.lower() for s in COMP_SUFFIX):
+            company = l.title()
+            break
+
+    # name (smart)
+    name = ""
+    for l in lines:
+        if (2 <= len(l.split()) <= 4 and
+            not any(k in l.lower() for k in ROLE_KEYWORDS) and
+            not any(s in l.lower() for s in COMP_SUFFIX) and
+            "@" not in l and ".com" not in l.lower() and ".in" not in l.lower() and
+            not any(ch.isdigit() for ch in l)):
+            name = l.title()
+            break
+    if not name and lines:
+        name = lines[0].title()
+
+    return {
+        "Name": name,
+        "Company": company,
+        "Role": role,
+        "Phone": primary,
+        "SecondPhone": secondary,
+        "TollFree": toll,
+        "Email": email,
+        "Website": website,
+        "RawText": block,
+        "Timestamp": datetime.utcnow().isoformat()
+    }
+
+# ---------------- CSV storage helpers ----------------
+def load_csv():
     try:
         return pd.read_csv("scans.csv")
-    except:
-        return pd.DataFrame(columns=[
-            "Name", "Company", "Role", "Phone", "Email", 
-            "Website", "RawText", "Timestamp"
-        ])
+    except Exception:
+        return pd.DataFrame(columns=["Name","Company","Role","Phone","SecondPhone","TollFree","Email","Website","RawText","Timestamp"])
 
-def save_scan(data):
-    """Save a new scan to CSV"""
-    try:
-        df = load_scans()
-        new_df = pd.concat([df, pd.DataFrame([data])], ignore_index=True)
-        new_df.to_csv("scans.csv", index=False)
-        return True
-    except Exception as e:
-        st.error(f"Save error: {e}")
-        return False
+def save_row(row):
+    df = load_csv()
+    df.loc[len(df)] = row
+    df.to_csv("scans.csv", index=False)
 
-# ---------------- STREAMLIT UI ----------------
-st.title("📇 Business Card Scanner — DeepSeek")
-st.markdown("**Powered by DeepSeek AI**")
+# ---------------- UI ----------------
+st.title("📇 Business Card Scanner — RapidOCR (free)")
 
-col1, col2 = st.columns([2, 1])
+col1, col2 = st.columns([2,1])
 
 with col1:
-    st.subheader("📸 Capture Card")
-    
-    # Camera and file upload
-    cam_image = st.camera_input("Take photo with camera")
-    uploaded_file = st.file_uploader("Or upload image", type=["jpg", "jpeg", "png"])
-    
-    # Use whichever image is available
-    image_bytes = None
-    if cam_image:
-        image_bytes = cam_image.getvalue()
-    elif uploaded_file:
-        image_bytes = uploaded_file.read()
-    
-    if image_bytes:
-        st.image(image_bytes, caption="Image to Scan", use_column_width=True)
+    cam = st.camera_input("📸 Take photo")
+    upload = st.file_uploader("Upload image", type=["png","jpg","jpeg"])
 
 with col2:
-    st.subheader("⚙️ Settings")
-    auto_save = st.checkbox("Auto-save scans", value=True)
-    
-    if st.button("🔄 Clear All Data"):
-        try:
-            empty_df = pd.DataFrame(columns=["Name", "Company", "Role", "Phone", "Email", "Website", "RawText", "Timestamp"])
-            empty_df.to_csv("scans.csv", index=False)
-            st.success("All data cleared!")
-            st.rerun()
-        except Exception as e:
-            st.error(f"Clear error: {e}")
+    auto = st.checkbox("Auto-save to CSV", value=True)
+    show_raw = st.checkbox("Show OCR raw text", value=False)
+    use_sample = st.button("Use sample image (debug)")
 
-# Process image when available
-if image_bytes and st.button("🔍 Scan with DeepSeek", type="primary"):
-    with st.spinner("🔄 Calling DeepSeek API..."):
-        raw_text = deepseek_ocr(image_bytes)
-        
-        st.subheader("📄 OCR Results")
-        
-        if raw_text and not any(error in raw_text for error in ["OCR Error", "API Error"]):
-            st.success("✅ DeepSeek OCR Successful!")
-            
-            # Show raw text
-            with st.expander("📋 Raw Extracted Text"):
-                st.text_area("Full text", raw_text, height=200, key="raw_text")
-            
-            # Extract fields
-            parsed_data = extract_fields_advanced(raw_text)
-            
-            # Display extracted fields
-            st.subheader("👤 Extracted Information")
-            
-            col1, col2 = st.columns(2)
-            
-            with col1:
-                st.text_input("Name", parsed_data["Name"], key="name_display")
-                st.text_input("Company", parsed_data["Company"], key="company_display")
-                st.text_input("Role", parsed_data["Role"], key="role_display")
-            
-            with col2:
-                st.text_input("Phone", parsed_data["Phone"], key="phone_display")
-                st.text_input("Email", parsed_data["Email"], key="email_display")
-                st.text_input("Website", parsed_data["Website"], key="website_display")
-            
-            # Save data
-            if auto_save:
-                if save_scan(parsed_data):
-                    st.success("✅ Scan saved automatically!")
-            else:
-                if st.button("💾 Save This Scan"):
-                    if save_scan(parsed_data):
-                        st.success("✅ Scan saved!")
-        else:
-            st.error(f"❌ {raw_text}")
-            
-            # Debug information
-            with st.expander("🔧 Debug Information"):
-                st.write("**API Key Status:**", "Configured" if API_KEY else "Missing")
-                st.write("**Image Size:**", f"{len(image_bytes)} bytes")
-                
-                if st.button("Test DeepSeek API Connection"):
-                    try:
-                        headers = {"Authorization": f"Bearer {API_KEY}"}
-                        # Test with a simple text request
-                        test_payload = {
-                            "model": "deepseek-chat",
-                            "messages": [{"role": "user", "content": "Say 'API is working'"}],
-                            "max_tokens": 10
-                        }
-                        response = requests.post(API_URL, headers=headers, json=test_payload, timeout=30)
-                        if response.status_code == 200:
-                            st.success("✅ DeepSeek API Connection Successful!")
-                        else:
-                            st.error(f"❌ API Test Failed: {response.status_code} - {response.text}")
-                    except Exception as e:
-                        st.error(f"❌ API Test Error: {e}")
-
-# Display history
-st.subheader("📚 Scan History")
-df = load_scans()
-
-if not df.empty:
-    # Display without raw text for cleaner view
-    display_cols = [col for col in df.columns if col != "RawText"]
-    st.dataframe(df[display_cols].sort_values("Timestamp", ascending=False), 
-                use_container_width=True,
-                height=400)
-    
-    # Download option
-    csv = df.to_csv(index=False).encode('utf-8')
-    st.download_button(
-        "📥 Download CSV",
-        data=csv,
-        file_name="business_cards.csv",
-        mime="text/csv"
-    )
+if use_sample:
+    # try to load the sample local file you uploaded earlier
+    try:
+        with open(SAMPLE_LOCAL_PATH, "rb") as f:
+            image_bytes = f.read()
+    except Exception as e:
+        st.error(f"Could not load sample file: {e}")
+        image_bytes = None
 else:
-    st.info("No scans yet. Capture a business card to get started!")
+    image_bytes = None
+    if cam:
+        image_bytes = cam.getvalue()
+    elif upload:
+        image_bytes = upload.read()
 
-# API status
-with st.expander("ℹ️ DeepSeek Status"):
-    st.markdown("""
-    **DeepSeek Features:**
-    - OCR via base64 image embedding
-    - Handles various fonts and layouts
-    - Extracts text from business cards
-    - Supports multiple languages
-    
-    **Current Status:** ✅ Configured
-    **Model:** deepseek-chat
-    **Endpoint:** https://api.deepseek.com/v1/chat/completions
-    """)
+if image_bytes:
+    st.image(image_bytes, caption="Input", use_column_width=True)
+
+    with st.spinner("Running OCR…"):
+        ocr_text = ocr_dispatch(image_bytes)
+
+    if show_raw:
+        st.text_area("OCR Output", ocr_text, height=250)
+
+    parsed = extract_fields(ocr_text)
+    st.subheader("Extracted fields")
+    st.json(parsed)
+
+    if auto:
+        save_row(parsed)
+        st.success("Saved to scans.csv")
+
+else:
+    st.info("Take a photo or upload an image of a business card. You can click 'Use sample image (debug)' to try the demo image.")
+
+df = load_csv()
+st.subheader("Saved entries")
+st.dataframe(df, use_container_width=True)
+csv = df.to_csv(index=False).encode("utf-8")
+st.download_button("Download CSV", csv, "cards.csv", "text/csv")
+
+# End of app.py
